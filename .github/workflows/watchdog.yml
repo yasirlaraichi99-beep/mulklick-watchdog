@@ -4,8 +4,7 @@ name: Watchdog Mulklick
 # Alertes Telegram. Logique et seuils : watchdog.mjs. Lecture seule : aucune connexion à la base.
 #
 # DÉPÔT PUBLIC : les minutes Actions y sont gratuites. Aucun secret dans ce fichier ; tout passe
-# par les secrets du dépôt (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SUPABASE_PROJECT_REF,
-# SUPABASE_SERVICE_KEY). Les journaux des runs sont publics : le script n'y écrit que des statuts.
+# par les secrets du dépôt (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID). Les journaux des runs sont publics : le script n'y écrit que des statuts.
 # Aucun déclencheur pull_request : un fork ne peut rien lancer ici.
 
 on:
@@ -50,9 +49,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Contrôle D : sauté proprement tant que ces secrets n'existent pas.
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           WATCHDOG_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
           WATCHDOG_STATE_FILE: .watchdog-state/state.json
 
