@@ -1,0 +1,81 @@
+name: Watchdog Mulklick
+
+# Surveillance de mulklick.ch et de sa base, indépendante de la base, du backend et de Vercel.
+# Alertes Telegram. Logique et seuils : watchdog.mjs. Lecture seule : aucune connexion à la base.
+#
+# DÉPÔT PUBLIC : les minutes Actions y sont gratuites. Aucun secret dans ce fichier ; tout passe
+# par les secrets du dépôt (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SUPABASE_PROJECT_REF,
+# SUPABASE_SERVICE_KEY). Les journaux des runs sont publics : le script n'y écrit que des statuts.
+# Aucun déclencheur pull_request : un fork ne peut rien lancer ici.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+    # Garde-vie : GitHub désactive le cron d'un dépôt public après 60 jours sans activité.
+    - cron: '17 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Envoyer un message Telegram de test même si tout va bien'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    if: github.event.schedule != '17 6 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Un seul passage à la fois : deux runs simultanés se disputeraient l'état anti-spam.
+    concurrency:
+      group: watchdog
+      cancel-in-progress: false
+    steps:
+      - name: Récupérer le script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Relire l'état précédent (anti-spam)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .watchdog-state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watchdog-state-
+
+      - name: Contrôles A, B, C, D
+        run: node watchdog.mjs
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Contrôle D : sauté proprement tant que ces secrets n'existent pas.
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          WATCHDOG_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
+          WATCHDOG_STATE_FILE: .watchdog-state/state.json
+
+      - name: Mémoriser l'état
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .watchdog-state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+  keepalive:
+    if: github.event.schedule == '17 6 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Commit mensuel (activité du dépôt)
+        run: |
+          date -u +%Y-%m-%dT%H:%MZ > .keepalive
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .keepalive
+          git commit -m 'chore: garde-vie mensuel du cron (règle GitHub des 60 jours)'
+          git push
