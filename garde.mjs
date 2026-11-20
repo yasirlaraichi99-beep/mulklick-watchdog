@@ -169,6 +169,9 @@ export async function signaler({ fetchImpl, env, garde, m, dest, messageId, log 
     telegram: { chat_id: String(dest.chatId), thread_id: dest.threadId, message_id: messageId },
   };
   if (garde.acks[m.key]) corps.acquitte_le = new Date(garde.acks[m.key]).toISOString();
+  // Le dernier signal complet est gardé : un accusé de réception ultérieur le renvoie tel quel
+  // (le cockpit exige niveau, quoi et detecte_le à chaque signal).
+  if (m.kind !== 'close') garde.corps = { ...(garde.corps || {}), [m.key]: { ...corps, etat: 'ouvert' } };
   const r = await cockpit({ fetchImpl, env, method: 'POST', path: '/admin/oncall/watchdog/incidents', body: corps });
   if (r.ok) delete garde.unsynced[m.key];
   else {
@@ -179,6 +182,7 @@ export async function signaler({ fetchImpl, env, garde, m, dest, messageId, log 
     garde.closedTopics[m.key] = garde.topics[m.key];
     delete garde.topics[m.key];
     for (const k of ['acks', 'ackSent', 'lastAbsolute', 'concludeWarned']) delete garde[k][m.key];
+    if (garde.corps) delete garde.corps[m.key];
   }
 }
 
@@ -190,9 +194,11 @@ export async function rattraper({ fetchImpl, env, garde, log = () => {} }) {
     else log(`Garde : signal « ${key} » toujours non reçu (${r.err}).`);
   }
   for (const [key, ts] of Object.entries(garde.acks)) {
-    if (garde.ackSent[key] === ts || garde.unsynced[key]) continue;
-    const r = await cockpit({ fetchImpl, env, method: 'POST', path: '/admin/oncall/watchdog/incidents', body: { cle: key, etat: 'ouvert', acquitte_le: new Date(ts).toISOString() } });
+    const dernier = garde.corps && garde.corps[key];
+    if (garde.ackSent[key] === ts || garde.unsynced[key] || !dernier) continue;
+    const r = await cockpit({ fetchImpl, env, method: 'POST', path: '/admin/oncall/watchdog/incidents', body: { ...dernier, acquitte_le: new Date(ts).toISOString() } });
     if (r.ok) garde.ackSent[key] = ts;
+    else log(`Garde : réponse de Yasir sur « ${key} » non transmise au cockpit (${r.err}).`);
   }
 }
 
@@ -245,8 +251,11 @@ export function planDelais({ garde, incidents, list, err, nowMs, cfg = GARDE_CFG
       });
     }
 
-    // b) Pris en charge, mais aucun diagnostic dans le délai → un seul message.
-    if (obj && obj.pris_en_charge_le && !obj.diagnostique_le && !garde.concludeWarned[key]) {
+    // b) Pris en charge, mais aucun diagnostic dans le délai → un seul message, et SEULEMENT si le
+    //    cockpit n'a pas déjà passé la main (relais exécuté, ou incident remis à Yasir) : c'est le
+    //    filet de sécurité quand la tâche planifiée du cockpit ne fait plus son travail.
+    const dejaRelaye = (obj && obj.agent_relais && obj.agent_relais.tire_le) || (obj && ['a_yasir', 'releve'].includes(obj.etape));
+    if (obj && obj.pris_en_charge_le && !obj.diagnostique_le && !dejaRelaye && !garde.concludeWarned[key]) {
       const pris = Date.parse(obj.pris_en_charge_le);
       if (Number.isFinite(pris) && nowMs - pris > cfg.concludeMs[level]) {
         out.push({

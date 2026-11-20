@@ -24,6 +24,7 @@ const TOKEN = 'TEST-TOKEN-NOT-REAL';
 const COCKPIT = 'https://cockpit.example';
 const COCKPIT_JETON = 'w'.repeat(40);
 
+const GARDE_CLES = ['base', 'site', 'fraicheur', 'disque', 'disque_lecture', 'relais'];
 const HEALTH_OK = { db_ok: true, latest_capture: '2026-11-24', age_hours: 9, response_ms: 40, disk_level: 'ok', disk_pct: 50 };
 const HEALTHY_HTML = `<html>${'<polyline data-spark=""></polyline>'.repeat(8)}${' '.repeat(30_000)}</html>`;
 const EMPTY_HTML = `<html>${'<div>Aucune valeur actuelle</div>'.repeat(8)}${' '.repeat(30_000)}</html>`;
@@ -94,11 +95,17 @@ export const AGENTS = {
 
 // ───────────────────────────── cockpit simulé (contrat v2) ─────────────────────────────
 
+// Modèle FIDÈLE au backend (admin-backend PR #10, app/services/prise_en_charge.py) :
+// · la route A exige cle, niveau, etat, quoi et detecte_le (sinon 422) ;
+// · le relais est un runbook : il prend en charge et rend des CONSTATS (etape a_yasir), sans
+//   renseigner diagnostique_le ; coupé, il laisse l'incident à Yasir (message « 🆘 À toi ») ;
+// · « ouvert » sur un incident déjà ouvert met à jour sans rien remettre à zéro.
 class FakeCockpit {
-  constructor({ tg, principal, relaisActif = true, down = () => false }) {
-    Object.assign(this, { tg, principal, relaisActif, down });
+  constructor({ tg, principal, relaisActif = true, down = () => false, tickCasse = () => false }) {
+    Object.assign(this, { tg, principal, relaisActif, down, tickCasse });
     this.incs = [];
     this.appels = 0;
+    this.refus = 0;
     this.seq = 1;
   }
   delaiPrise(niveau) {
@@ -108,7 +115,13 @@ class FakeCockpit {
     this.appels += 1;
     if (this.down(now)) return null; // injoignable
     if (method === 'GET') {
-      return { incidents: this.incs.filter((i) => !i.resolved_at || now - i.resolved_at < DAY).map((i) => this.vue(i, now)) };
+      return { status: 200, body: { incidents: this.incs.filter((i) => !i.resolved_at || now - i.resolved_at < DAY).map((i) => this.vue(i, now)) } };
+    }
+    const valide = body && GARDE_CLES.includes(body.cle) && ['urgent', 'important'].includes(body.niveau)
+      && ['ouvert', 'aggrave', 'ameliore', 'resolu'].includes(body.etat) && body.quoi && Number.isFinite(Date.parse(body.detecte_le));
+    if (!valide) {
+      this.refus += 1;
+      return { status: 422, body: { detail: 'corps_invalide' } };
     }
     let inc = this.incs.find((i) => i.cle === body.cle && !i.resolved_at);
     if (!inc && body.etat === 'ouvert' && body.niveau) {
@@ -121,15 +134,15 @@ class FakeCockpit {
       this.tirerPrincipal(inc, now);
     }
     if (inc) {
-      if (body.acquitte_le) inc.acquitte_le = Date.parse(body.acquitte_le);
+      if (body.acquitte_le && !inc.acquitte_le) inc.acquitte_le = Date.parse(body.acquitte_le);
       if (body.niveau && (body.etat === 'aggrave' || body.etat === 'ameliore')) inc.niveau = body.niveau;
-      if (body.telegram) inc.telegram = body.telegram;
+      if (body.telegram && !inc.telegram) inc.telegram = body.telegram;
       if (body.etat === 'resolu') {
         inc.etape = 'resolu';
         inc.resolved_at = now;
       }
     }
-    return inc ? this.vue(inc, now) : { ok: true };
+    return { status: 200, body: inc ? this.vue(inc, now) : { ok: true } };
   }
   poster(inc, texte, sonore, now) {
     this.tg.poster('cockpit', inc.telegram ? inc.telegram.thread_id : null, texte, sonore, now);
@@ -143,16 +156,23 @@ class FakeCockpit {
   }
   tirerRelais(inc, now, motif) {
     if (inc.relais) return;
-    inc.relais = { tire_le: now, resultat: this.relaisActif ? 'declenchee' : 'coupe', motif };
-    inc.journal.push(`[relais] ${inc.relais.resultat} — ${motif}`);
-    if (!this.relaisActif) return;
-    // Agent relais (runbook automatique) : prise en charge, vérifications en lecture, constats — même tick.
+    if (!this.relaisActif) {
+      // Relais coupé : l'incident revient à Yasir, avec la raison (un seul message).
+      inc.relais = { tire_le: null, resultat: 'non_configuree', motif };
+      inc.etape = 'a_yasir';
+      inc.journal.push(`[a-yasir] ${motif}`);
+      this.poster(inc, `🆘 À toi : ${inc.ref}, plus aucun agent disponible\n${motif}\nAgent relais coupé.`, inc.niveau === 'urgent', now);
+      return;
+    }
+    inc.relais = { tire_le: now, resultat: 'declenchee', motif };
+    inc.journal.push(`[relais] declenchee — ${motif}`);
+    // Agent relais (runbook automatique) : prise en charge, vérifications en lecture, CONSTATS
+    // (pas de diagnostic : diagnostique_le reste vide) — dans le même tick.
     if (!inc.pris_en_charge_le) {
       inc.pris_en_charge_le = now;
       inc.premierAgent = 'agent relais (runbook automatique)';
     }
     inc.agent = 'agent relais (runbook automatique)';
-    inc.diagnostique_le = now;
     inc.etape = 'a_yasir';
     inc.cause = `non déterminée — constats : ${motif} ; /api/health et /fr/intelligence vérifiés`;
     this.poster(inc, `🟠 Relais — ${motif}.\nConstats : santé et page publique vérifiées.\nÀ toi : vérifier le tableau de bord Supabase.`, inc.niveau === 'urgent', now);
@@ -165,7 +185,7 @@ class FakeCockpit {
     }
   }
   tick(now) {
-    if (this.down(now)) return;
+    if (this.down(now) || this.tickCasse(now)) return;
     for (const inc of this.incs) {
       if (inc.resolved_at) continue;
       for (const act of inc.actions) {
@@ -203,7 +223,7 @@ class FakeCockpit {
       if (!inc.principal) raison = 'agent principal jamais tiré';
       else if (inc.principal.resultat !== 'declenchee') raison = `tir de l’agent principal en échec (${inc.principal.detail})`;
       else raison = `agent principal tiré à ${hhmm(inc.principal.tire_le)} UTC, aucun signe depuis`;
-      if (inc.relais && inc.relais.resultat === 'coupe') raison += ' ; agent relais coupé';
+      if (inc.relais && inc.relais.resultat === 'non_configuree') raison += ' ; agent relais coupé';
     }
     const iso = (v) => (v ? new Date(v).toISOString() : null);
     return {
@@ -211,7 +231,7 @@ class FakeCockpit {
       echeance_prise_en_charge: iso(inc.echeance), pris_en_charge_le: iso(inc.pris_en_charge_le), agent: inc.agent,
       diagnostique_le: iso(inc.diagnostique_le), cause: inc.cause, correctif: inc.correctif,
       agent_principal: inc.principal ? { tire_le: iso(inc.principal.tire_le), resultat: inc.principal.resultat, detail: inc.principal.detail } : null,
-      agent_relais: inc.relais ? { tire_le: iso(inc.relais.tire_le), resultat: inc.relais.resultat, detail: inc.relais.motif } : { tire_le: null },
+      agent_relais: inc.relais ? { tire_le: iso(inc.relais.tire_le), resultat: inc.relais.resultat, detail: inc.relais.motif } : { tire_le: null, resultat: null, detail: null },
       raison_silence: raison, telegram: inc.telegram,
     };
   }
@@ -236,7 +256,7 @@ function reseau({ tg, cockpit, site, now }) {
       if (u.pathname !== '/admin/oncall/watchdog/incidents') return jsonRes(404, { detail: 'inconnu' });
       const r = cockpit.handle(init.method || 'GET', init.body ? JSON.parse(init.body) : null, now());
       if (r === null) throw Object.assign(new Error('fetch failed'), { name: 'TypeError' });
-      return jsonRes(200, r);
+      return jsonRes(r.status, r.body);
     }
     if (u.hostname === 'www.mulklick.ch' && u.pathname === '/api/health') {
       const s = site();
@@ -255,7 +275,8 @@ function reseau({ tg, cockpit, site, now }) {
 export async function simuler(sc) {
   const tg = new FakeTelegram();
   let t = START;
-  const cockpit = new FakeCockpit({ tg, principal: sc.principal, relaisActif: sc.relaisActif !== false, down: sc.cockpitDown || (() => false) });
+  const cockpit = new FakeCockpit({ tg, principal: sc.principal, relaisActif: sc.relaisActif !== false, down: sc.cockpitDown || (() => false),
+    tickCasse: sc.tickCasseApresMin !== undefined ? (now) => now >= START + sc.tickCasseApresMin * MIN : () => false });
   let state = null;
   let premiereAbsolue = null;
   const env = sc.garde === false ? ENV_SANS_GARDE : ENV_GARDE;
@@ -363,8 +384,19 @@ export const SCENARIOS = [
     },
   },
   {
-    id: '7b', nom: 'Jamais conclu, relais coupé : le watchdog prévient seul',
+    id: '7b', nom: 'Jamais conclu, relais coupé : le cockpit passe la main à Yasir',
     site: (m) => (m >= 10 && m < 190 ? SITE.baseDown : SITE.ok), dureeMin: 280, principal: AGENTS.jamaisConclu(), relaisActif: false,
+    verifier: (r) => {
+      const [i] = r.cockpit.incs;
+      const annonces = r.tg.msgs.filter((x) => /pas de diagnostic depuis|aucun diagnostic dans le délai/.test(x.text));
+      const parLeWatchdog = annonces.filter((x) => x.de === 'watchdog');
+      return [[i && dansLeDelai(i), 'pris en charge en moins de 5 min'], [annonces.length === 1, 'dépassement annoncé une seule fois (« 🆘 À toi » du cockpit)'],
+        [parLeWatchdog.length === 0, 'le watchdog ne répète pas ce que le cockpit a dit'], [absolues(r).length === 0, 'aucune urgence absolue (l’incident a bien été pris)']];
+    },
+  },
+  {
+    id: '7c', nom: 'Jamais conclu, tâche du cockpit en panne : le watchdog prévient seul',
+    site: (m) => (m >= 10 && m < 190 ? SITE.baseDown : SITE.ok), dureeMin: 280, principal: AGENTS.jamaisConclu(), tickCasseApresMin: 30,
     verifier: (r) => {
       const [i] = r.cockpit.incs;
       const parLeWatchdog = r.tg.msgs.filter((x) => x.de === 'watchdog' && /pas de diagnostic depuis/.test(x.text));
@@ -411,6 +443,7 @@ export async function executerBanc() {
     try {
       const r = await simuler(sc);
       verifs = sc.verifier(r).map(([ok, quoi]) => ({ ok: Boolean(ok), quoi }));
+      verifs.push({ ok: r.cockpit.refus === 0, quoi: `aucun signal refusé par le cockpit (422 : ${r.cockpit.refus})` });
       mesures = {
         incidents: r.cockpit.incs.length,
         prisEnCharge: r.cockpit.incs.map((i) => (i.pris_en_charge_le ? `${Math.round((i.pris_en_charge_le - i.detecte_le) / MIN)} min (${i.premierAgent})` : 'jamais')),
