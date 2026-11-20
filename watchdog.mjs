@@ -5,7 +5,10 @@
 //
 // Quatre contrôles :
 //   A — panne      : GET /api/health → 200 et db_ok=true, 3 essais espacés de 20 s.
-//   B — page       : GET /fr/intelligence → les cartes nationales affichent des valeurs.
+//   B — page       : GET /fr/intelligence → les cartes nationales ont une donnée. Deux formats lus :
+//                    NOUVEAU (data-card-state="value|reserved|empty" : une donnée masquée aux visiteurs
+//                    non connectés compte comme présente) ou ANCIEN (courbes data-spark / « Aucune valeur
+//                    actuelle »). Le watchdog reste anonyme : aucune session, aucun cookie, aucune clé.
 //   C — fraîcheur  : age_hours (rendu par /api/health) ≤ seuil.
 //   D — disque     : disk_level / disk_pct (rendus par /api/health), avec projection du remplissage.
 //
@@ -50,8 +53,17 @@ export const CONFIG = {
   // - carte SANS donnée : « Aucune valeur actuelle », une fois par carte vide ;
   // - carte AVEC donnée : la courbe <polyline data-spark="">, rendue seulement quand la carte a un
   //   score. La page en porte 8 quand tout va bien (environ 130 Ko de HTML).
+  // Format ANCIEN ci-dessus, utilisé seulement si la page ne porte aucun « data-card-state= ».
+  // Format NOUVEAU (données réservées aux visiteurs connectés) : chaque carte porte
+  // data-card-state="value" (en clair), "reserved" (donnée présente mais masquée) ou "empty" (aucune
+  // donnée). Présent = value + reserved ; absent = empty. Les deux formats marchent, avant et après
+  // le déploiement du site.
   markerAbsent: 'Aucune valeur actuelle',
   markerPresent: 'data-spark=""',
+  markerCardState: 'data-card-state=',
+  markerCardValue: 'data-card-state="value"',
+  markerCardReserved: 'data-card-state="reserved"',
+  markerCardEmpty: 'data-card-state="empty"',
   expectedCards: 8,
   minPageBytes: 20_000, // sans aucun marqueur et plus courte que ça : page vide ou page d'erreur
   healthAttempts: 3,
@@ -222,9 +234,21 @@ export async function checkPage({ fetchImpl, sleep, cfg = CONFIG }) {
         last = `HTTP ${res.status}`;
       } else {
         const html = await res.text();
-        const absent = countOccurrences(html, cfg.markerAbsent);
-        const present = countOccurrences(html, cfg.markerPresent);
-        const counts = `${present}/${cfg.expectedCards} cartes chiffrées, ${absent} « ${cfg.markerAbsent} »`;
+        let absent;
+        let present;
+        let counts;
+        if (countOccurrences(html, cfg.markerCardState) > 0) {
+          // Nouveau format : un seul marqueur par carte, pas de double comptage avec data-spark.
+          const clear = countOccurrences(html, cfg.markerCardValue);
+          const hidden = countOccurrences(html, cfg.markerCardReserved);
+          absent = countOccurrences(html, cfg.markerCardEmpty);
+          present = clear + hidden;
+          counts = `${present}/${cfg.expectedCards} cartes avec donnée (${clear} en clair, ${hidden} masquées), ${absent} vides`;
+        } else {
+          absent = countOccurrences(html, cfg.markerAbsent);
+          present = countOccurrences(html, cfg.markerPresent);
+          counts = `${present}/${cfg.expectedCards} cartes chiffrées, ${absent} « ${cfg.markerAbsent} »`;
+        }
         // Les marqueurs dépendent du contenu, pas du réseau : inutile de réessayer.
         if (present === 0 && absent > 0) return { id: 'B', status: 'crit', value: `données absentes : ${counts}` };
         if (present === 0 && html.length < cfg.minPageBytes) {

@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runOnce, planRun, zurichNow, weekKey, projectDiskDays, updateDiskSteps, normalizeState, CONFIG } from './watchdog.mjs';
+import { runOnce, planRun, zurichNow, weekKey, projectDiskDays, updateDiskSteps, normalizeState, CONFIG, checkPage } from './watchdog.mjs';
 
 const MIN = 60_000;
 const H = 60 * MIN;
@@ -19,6 +19,12 @@ const MON_23_0800_CH = Date.UTC(2026, 10, 23, 7, 0); // lun. 23.11.2026 08:00 he
 const HEALTHY_HTML = `<html>${'<polyline data-spark="" points="0,1 2,3"></polyline>'.repeat(8)}${' '.repeat(30_000)}</html>`;
 const EMPTY_HTML = `<html>${'<div>Aucune valeur actuelle</div>'.repeat(8)}${' '.repeat(30_000)}</html>`;
 const PARTIAL_HTML = `<html>${'<polyline data-spark=""></polyline>'.repeat(6)}${'<div>Aucune valeur actuelle</div>'.repeat(2)}</html>`;
+const cards = (n, state) => `<article data-card-state="${state}"></article>`.repeat(n);
+const PAD = ' '.repeat(30_000);
+const RESERVED_HEALTHY_HTML = `<html>${cards(3, 'value')}${cards(5, 'reserved')}${PAD}</html>`;
+const RESERVED_EMPTY_HTML = `<html>${cards(8, 'empty')}${'<div>Aucune valeur actuelle</div>'.repeat(8)}${PAD}</html>`;
+const RESERVED_PARTIAL_HTML = `<html>${cards(3, 'value')}${cards(3, 'reserved')}${cards(2, 'empty')}${PAD}</html>`;
+const MIXED_HTML = `<html>${'<article data-card-state="value"><polyline data-spark=""></polyline></article>'.repeat(3)}${cards(5, 'reserved')}${PAD}</html>`;
 const HEALTH_OK = { db_ok: true, latest_capture: '2026-11-19', age_hours: 14, response_ms: 42, disk_level: 'ok', disk_pct: 50 };
 const DOWN = { healthStatus: 503, healthBody: { db_ok: false, disk_level: null, disk_pct: null } };
 const disk = (pct) => ({
@@ -155,6 +161,33 @@ test('données absentes alors que la base répond : URGENT sonore', async () => 
   assert.equal(r.calls.telegram.length, 1);
   assert.equal(r.calls.telegram[0].silent, false);
   assert.match(r.calls.telegram[0].text, /^🔴 URGENT — Page publique sans données alors que la base répond/);
+});
+
+test('cartes réservées (3 en clair + 5 masquées) : aucun message, comptage lisible', async () => {
+  const r = await run({ pageHtml: RESERVED_HEALTHY_HTML });
+  assert.equal(r.calls.telegram.length, 0);
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: RESERVED_HEALTHY_HTML }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'ok');
+  assert.match(b.value, /8\/8 cartes avec donnée \(3 en clair, 5 masquées\), 0 vides/);
+});
+
+test('cartes réservées : 8 vides → URGENT sonore', async () => {
+  const r = await run({ pageHtml: RESERVED_EMPTY_HTML });
+  assert.equal(r.calls.telegram.length, 1);
+  assert.equal(r.calls.telegram[0].silent, false);
+  assert.match(r.calls.telegram[0].text, /^🔴 URGENT — Page publique sans données/);
+});
+
+test('cartes réservées : 6 présentes + 2 vides → avertissement (données partielles)', async () => {
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: RESERVED_PARTIAL_HTML }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'warn');
+  assert.match(b.value, /données partielles : 6\/8 cartes avec donnée \(3 en clair, 3 masquées\), 2 vides/);
+});
+
+test('page avec data-spark ET data-card-state : une carte n’est comptée qu’une fois', async () => {
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: MIXED_HTML }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'ok');
+  assert.match(b.value, /8\/8 cartes avec donnée \(3 en clair, 5 masquées\)/);
 });
 
 test('page blanche ou page d’erreur servie en 200 : URGENT, pas un simple avertissement', async () => {
