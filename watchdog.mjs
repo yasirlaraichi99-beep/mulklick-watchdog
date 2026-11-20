@@ -14,6 +14,10 @@
 // retour. Si l'envoi Telegram échoue, l'état n'est PAS avancé (l'alerte repartira au run suivant)
 // et le job échoue.
 //
+// Bilan du matin : chaque jour, au premier passage à partir de 08:00 heure suisse, un message
+// « tout va bien » (heure du passage, niveau du disque, passages depuis le bilan précédent). C'est
+// le signe de vie du watchdog : s'il manque un matin, le watchdog est arrêté.
+//
 // Aucune dépendance : Node ≥ 20 (fetch global). Le module exporte sa logique pour les tests
 // (watchdog.test.mjs), qui simulent toutes les réponses réseau — aucun vrai message n'y part.
 
@@ -39,6 +43,11 @@ export const CONFIG = {
   // Seuil = cadence + 2 jours = 5 jours.
   freshnessMaxHours: 120,
   reminderMs: 55 * 60_000, // « une fois par heure » ; 5 min de marge pour le retard du cron GitHub
+  // Bilan quotidien « tout va bien » : premier passage à partir de 08:00 heure suisse, une fois par
+  // jour (date suisse). C'est le signe de vie du watchdog : s'il manque un matin, le watchdog est
+  // arrêté. Le fuseau Europe/Zurich gère seul le passage heure d'été / heure d'hiver.
+  dailyHourZurich: 8,
+  expectedPassesPerDay: 144, // un passage toutes les 10 minutes
 };
 
 const LABELS = {
@@ -69,6 +78,25 @@ async function fetchWithTimeout(fetchImpl, url, init = {}, timeoutMs = CONFIG.re
 
 function fmtUtc(nowMs) {
   return new Date(nowMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+}
+
+/** Date (AAAA-MM-JJ), heure et libellé « JJ.MM.AAAA HH:MM » à l'heure suisse. */
+export function zurichNow(nowMs) {
+  const f = new Intl.DateTimeFormat('fr-CH', {
+    timeZone: 'Europe/Zurich',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
+  const p = Object.fromEntries(f.formatToParts(new Date(nowMs)).map((x) => [x.type, x.value]));
+  return {
+    date: `${p.year}-${p.month}-${p.day}`,
+    hour: Number(p.hour),
+    label: `${p.day}.${p.month}.${p.year} ${p.hour}:${p.minute}`,
+  };
 }
 
 function fmtDuration(ms) {
@@ -175,9 +203,10 @@ export function checkDisk(healthResult) {
     return { id: 'D', status: 'warn', value: 'niveau disque absent de /api/health' };
   }
   const value = `≈ ${h.disk_pct} % de 18 GB (taille de la base, hors journaux Postgres ; seuils 65 / 80 %)`;
-  if (level === 'ok') return { id: 'D', status: 'ok', value };
-  if (level === 'avertissement') return { id: 'D', status: 'warn', value };
-  if (level === 'critique') return { id: 'D', status: 'crit', value };
+  const pct = h.disk_pct;
+  if (level === 'ok') return { id: 'D', status: 'ok', value, level, pct };
+  if (level === 'avertissement') return { id: 'D', status: 'warn', value, level, pct };
+  if (level === 'critique') return { id: 'D', status: 'crit', value, level, pct };
   return { id: 'D', status: 'warn', value: `niveau disque inconnu : ${level}` };
 }
 
@@ -245,6 +274,34 @@ export function testSummary(results, nowMs) {
   ].join('\n');
 }
 
+/**
+ * Bilan du matin : signe de vie quotidien. Toujours envoyé (même si un contrôle est en alerte),
+ * avec l'heure du passage, le niveau du disque, les contrôles en alerte s'il y en a, et le nombre
+ * de passages depuis le bilan précédent (≈ 144 attendus : un chiffre bas = déclencheur défaillant).
+ */
+export function dailySummary(results, nowMs, passes, cfg = CONFIG) {
+  const z = zurichNow(nowMs);
+  const ko = results.filter((r) => r.status === 'warn' || r.status === 'crit');
+  const d = results.find((r) => r.id === 'D');
+  const disk =
+    d && d.level
+      ? `${d.level}, ≈ ${d.pct} % de 18 GB`
+      : d && d.status === 'skip'
+        ? 'non mesuré (site injoignable)'
+        : `non mesuré (${d ? d.value : 'contrôle absent'})`;
+  const mark = { warn: '🟠', crit: '🔴' };
+  return [
+    ko.length
+      ? `☀️ BILAN DU MATIN — watchdog actif, ${ko.length} contrôle${ko.length > 1 ? 's' : ''} en alerte`
+      : '☀️ BILAN DU MATIN — tout va bien',
+    `Dernier passage : ${z.label} (heure suisse)`,
+    `Disque : ${disk}`,
+    ...ko.map((r) => `${mark[r.status]} ${LABELS[r.id]} : ${r.value}`),
+    `Passages depuis le bilan précédent : ${passes} (≈ ${cfg.expectedPassesPerDay} attendus par jour)`,
+    'Si ce bilan manque un matin, le watchdog est arrêté : vérifier cron-job.org, puis l’onglet Actions de mulklick-watchdog.',
+  ].join('\n');
+}
+
 // ───────────────────────────── Telegram ─────────────────────────────
 
 export async function sendTelegram({ fetchImpl, token, chatId, text }) {
@@ -296,6 +353,14 @@ export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, no
   const testMode = String(env.WATCHDOG_TEST).toLowerCase() === 'true';
   const outgoing = [...messages];
   if (testMode) outgoing.push(testSummary(results, nowMs));
+
+  // Bilan du matin : une fois par date suisse, au premier passage à partir de 08:00.
+  const z = zurichNow(nowMs);
+  const passes = (prevState?.passesSinceDaily ?? 0) + 1;
+  const dailyDue = z.hour >= cfg.dailyHourZurich && prevState?.lastDailyDate !== z.date;
+  if (dailyDue) outgoing.push(dailySummary(results, nowMs, passes, cfg));
+  nextState.lastDailyDate = dailyDue ? z.date : (prevState?.lastDailyDate ?? null);
+  nextState.passesSinceDaily = dailyDue ? 0 : passes;
 
   if (!outgoing.length) {
     log('Aucun message à envoyer.');

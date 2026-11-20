@@ -21,6 +21,20 @@ Anti-spam : un message au passage OK → KO, un rappel par heure tant que c'est 
 🟢 « rétabli » au retour. Si l'envoi Telegram échoue, le job échoue et l'alerte repart au passage
 suivant.
 
+**Bilan du matin** : chaque jour, au premier passage à partir de 08:00 heure suisse, un message
+« ☀️ BILAN DU MATIN » donne l'heure du passage, le niveau du disque, les contrôles en alerte s'il
+y en a et le nombre de passages depuis le bilan précédent (≈ 144 attendus). **S'il manque un
+matin, le watchdog est arrêté.**
+
+## Déclenchement
+
+- **cron-job.org** appelle toutes les 10 minutes l'API `workflow_dispatch` de ce workflow, avec un
+  jeton GitHub limité à ce seul dépôt et au seul droit « Actions ». C'est le déclencheur principal :
+  depuis fin octobre 2026, le cron de GitHub ne déclenche plus les nouveaux workflows (problème
+  GitHub connu, non résolu), alors que le lancement manuel marche.
+- Le cron GitHub (`*/10`) est laissé en place : s'il se remet à marcher, il double simplement les
+  passages, sans doublon d'alerte (l'état anti-spam est partagé).
+
 ## Secrets du dépôt
 
 | Secret | Rôle |
