@@ -53,6 +53,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Facultatif : contrôleur de vie externe (ping à chaque passage). Absent = ignoré.
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
           WATCHDOG_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
           WATCHDOG_STATE_FILE: .watchdog-state/state.json
 
