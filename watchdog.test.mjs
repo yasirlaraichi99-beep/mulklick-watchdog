@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runOnce, decide, parsePrometheus, pickDataVolume, CONFIG } from './watchdog.mjs';
+import { runOnce, decide, CONFIG } from './watchdog.mjs';
 
 const T0 = Date.UTC(2026, 10, 19, 14, 0); // 19.11.2026 14:00 UTC
 const MIN = 60_000;
@@ -13,20 +13,6 @@ const MIN = 60_000;
 const HEALTHY_HTML = `<html>${'<polyline data-spark="" points="0,1 2,3"></polyline>'.repeat(8)}</html>`;
 const EMPTY_HTML = `<html>${'<div>Aucune valeur actuelle</div>'.repeat(8)}</html>`;
 const PARTIAL_HTML = `<html>${'<polyline data-spark=""></polyline>'.repeat(6)}${'<div>Aucune valeur actuelle</div>'.repeat(2)}</html>`;
-
-function prom({ size, avail, mountpoint = '/data' }) {
-  return [
-    '# HELP node_filesystem_size_bytes Filesystem size in bytes.',
-    '# TYPE node_filesystem_size_bytes gauge',
-    `node_filesystem_size_bytes{device="/dev/root",fstype="ext4",mountpoint="/",service_type="db",supabase_project_ref="abc"} 1.0e+10`,
-    `node_filesystem_size_bytes{device="/dev/nvme1n1",fstype="ext4",mountpoint="${mountpoint}",service_type="db",supabase_project_ref="abc"} ${size}`,
-    `node_filesystem_size_bytes{device="tmpfs",fstype="tmpfs",mountpoint="/run",service_type="db"} 9.9e+12`,
-    '# TYPE node_filesystem_avail_bytes gauge',
-    `node_filesystem_avail_bytes{device="/dev/root",fstype="ext4",mountpoint="/",service_type="db",supabase_project_ref="abc"} 5.0e+09`,
-    `node_filesystem_avail_bytes{device="/dev/nvme1n1",fstype="ext4",mountpoint="${mountpoint}",service_type="db",supabase_project_ref="abc"} ${avail}`,
-    `node_filesystem_avail_bytes{device="tmpfs",fstype="tmpfs",mountpoint="/run",service_type="db"} 9.9e+12`,
-  ].join('\n');
-}
 
 function jsonRes(status, body) {
   return { status, json: async () => body, text: async () => JSON.stringify(body) };
@@ -37,12 +23,13 @@ function textRes(status, text) {
 
 /**
  * Faux réseau. `site` décrit l'état simulé ; renvoie { fetchImpl, calls }.
- * calls.telegram = textes « envoyés » ; calls.health / calls.page / calls.metrics = nombre d'appels.
+ * calls.telegram = textes « envoyés » ; calls.health / calls.page = nombre d'appels ; calls.hosts = tous les hôtes contactés.
  */
 function fakeNet(site) {
-  const calls = { telegram: [], health: 0, page: 0, metrics: 0, authHeaders: [] };
+  const calls = { telegram: [], health: 0, page: 0, hosts: [] };
   const fetchImpl = async (url, init = {}) => {
     const u = new URL(url);
+    calls.hosts.push(u.hostname);
     if (u.hostname === 'api.telegram.org') {
       const body = JSON.parse(init.body);
       if (site.telegramFails) return jsonRes(401, { ok: false, description: 'Unauthorized' });
@@ -53,17 +40,12 @@ function fakeNet(site) {
       calls.health += 1;
       assert.ok(u.searchParams.get('wd'), 'paramètre anti-cache attendu sur /api/health');
       if (site.healthThrows) throw Object.assign(new Error('x'), { name: 'TimeoutError' });
-      return jsonRes(site.healthStatus ?? 200, site.healthBody ?? { db_ok: true, latest_capture: '2026-11-19', age_hours: 14, response_ms: 42 });
+      return jsonRes(site.healthStatus ?? 200, site.healthBody ?? { db_ok: true, latest_capture: '2026-11-19', age_hours: 14, response_ms: 42, disk_level: 'ok', disk_pct: 50 });
     }
     if (u.hostname === 'www.mulklick.ch' && u.pathname === '/fr/intelligence') {
       calls.page += 1;
       assert.ok(u.searchParams.get('wd'), 'paramètre anti-cache attendu sur la page');
       return textRes(site.pageStatus ?? 200, site.pageHtml ?? HEALTHY_HTML);
-    }
-    if (u.hostname === 'abcdefghijklmnopqrst.supabase.co' && u.pathname === '/customer/v1/privileged/metrics') {
-      calls.metrics += 1;
-      calls.authHeaders.push(init.headers?.authorization);
-      return textRes(site.metricsStatus ?? 200, site.metrics ?? prom({ size: 18e9, avail: 14e9 }));
     }
     throw new Error(`URL inattendue dans un test : ${u.hostname}${u.pathname}`);
   };
@@ -73,7 +55,6 @@ function fakeNet(site) {
 const BASE_ENV = {
   TELEGRAM_BOT_TOKEN: 'TEST-TOKEN-NOT-REAL',
   TELEGRAM_CHAT_ID: '42',
-  SUPABASE_PROJECT_REF: 'abcdefghijklmnopqrst',
 };
 
 async function run(site, { env = {}, prevState = null, nowMs = T0 } = {}) {
@@ -92,17 +73,15 @@ async function run(site, { env = {}, prevState = null, nowMs = T0 } = {}) {
   return { ...out, byId, calls: net.calls, sleeps, logs };
 }
 
-test('site OK : aucun message, contrôle disque sauté sans secret', async () => {
+test('site OK : aucun message, contrôle disque OK', async () => {
   const r = await run({});
   assert.equal(r.exitCode, 0);
   assert.equal(r.byId.A.status, 'ok');
   assert.equal(r.byId.B.status, 'ok');
   assert.equal(r.byId.C.status, 'ok');
-  assert.equal(r.byId.D.status, 'skip');
-  assert.match(r.byId.D.value, /SUPABASE_SERVICE_KEY absent/);
+  assert.equal(r.byId.D.status, 'ok');
   assert.equal(r.calls.telegram.length, 0);
-  assert.equal(r.calls.health, 1);
-  assert.equal(r.calls.metrics, 0, "pas d'appel aux métriques sans secret");
+  assert.equal(r.calls.health, 1, 'un seul appel /api/health pour A, C et D');
   assert.deepEqual(r.sleeps, []);
 });
 
@@ -176,40 +155,69 @@ test('données trop anciennes : C avertissement au-delà de 120 h', async () => 
   assert.equal(ok.byId.C.status, 'ok', 'week-end normal (ven → lun) : pas d’alerte');
 });
 
-test('disque à 72 % : avertissement ; à 90 % : critique', async () => {
-  const env = { SUPABASE_SERVICE_KEY: 'sb_secret_TEST' };
-  const w = await run({ metrics: prom({ size: 18e9, avail: 18e9 - 0.72 * 18e9 }) }, { env });
-  assert.equal(w.byId.D.status, 'warn');
-  assert.match(w.byId.D.value, /^72 %/);
-  assert.match(w.calls.telegram[0].text, /^🟠 AVERTISSEMENT — Contrôle D/);
-  assert.equal(w.calls.authHeaders[0], 'Basic ' + Buffer.from('service_role:sb_secret_TEST').toString('base64'));
-
-  const c = await run({ metrics: prom({ size: 18e9, avail: 18e9 - 0.9 * 18e9 }) }, { env });
-  assert.equal(c.byId.D.status, 'crit');
-  assert.match(c.byId.D.value, /^90 %/);
-  assert.match(c.calls.telegram[0].text, /^🔴 CRITIQUE — Contrôle D/);
+const withDisk = (disk_level, disk_pct) => ({
+  healthBody: { db_ok: true, latest_capture: '2026-11-19', age_hours: 14, response_ms: 42, disk_level, disk_pct },
 });
 
-test('disque actuel plus petit que le plafond : le pourcentage du disque réel compte aussi', async () => {
-  // 11,5 GB sur un disque de 12 GB = 96 % (Supabase passe en lecture seule à 95 %), mais 64 % de 18 GB.
-  const r = await run({ metrics: prom({ size: 12e9, avail: 0.5e9 }) }, { env: { SUPABASE_SERVICE_KEY: 'k' } });
+test('disque ok à 60 % : D ok, aucun message', async () => {
+  const r = await run(withDisk('ok', 60));
+  assert.equal(r.byId.D.status, 'ok');
+  assert.equal(r.calls.telegram.length, 0);
+});
+
+test('disque avertissement à 70 % : un message Telegram', async () => {
+  const r = await run(withDisk('avertissement', 70));
+  assert.equal(r.byId.D.status, 'warn');
+  assert.equal(r.calls.telegram.length, 1);
+  assert.match(r.calls.telegram[0].text, /^🟠 AVERTISSEMENT — Contrôle D/);
+  assert.match(r.calls.telegram[0].text, /≈ 70 %/);
+  assert.match(r.calls.telegram[0].text, /Libérer de la place/);
+});
+
+test('disque critique à 85 % : message critique', async () => {
+  const r = await run(withDisk('critique', 85));
   assert.equal(r.byId.D.status, 'crit');
-  assert.match(r.byId.D.value, /64 % de 18 GB/);
-  assert.match(r.byId.D.value, /96 % du disque actuel/);
+  assert.equal(r.calls.telegram.length, 1);
+  assert.match(r.calls.telegram[0].text, /^🔴 CRITIQUE — Contrôle D/);
 });
 
-test('secret disque absent : D sauté, les autres contrôles tournent', async () => {
-  const r = await run({ healthStatus: 503, healthBody: { db_ok: false } });
+test('200 sans champs disque : D avertissement « niveau disque absent »', async () => {
+  const r = await run({ healthBody: { db_ok: true, latest_capture: '2026-11-19', age_hours: 14, response_ms: 42 } });
+  assert.equal(r.byId.D.status, 'warn');
+  assert.match(r.byId.D.value, /niveau disque absent/);
+  const n = await run(withDisk(null, null));
+  assert.equal(n.byId.D.status, 'warn');
+  assert.match(n.byId.D.value, /niveau disque absent/);
+  assert.match(n.calls.telegram[0].text, /^🟠 AVERTISSEMENT — Contrôle D/);
+});
+
+test('/api/health en 503 : D sauté', async () => {
+  const r = await run({ healthStatus: 503, healthBody: { db_ok: false, latest_capture: null, age_hours: null, response_ms: 5001, disk_level: null, disk_pct: null } });
   assert.equal(r.byId.D.status, 'skip');
+  assert.match(r.byId.D.value, /non mesurable/);
   assert.equal(r.byId.A.status, 'crit');
   assert.equal(r.byId.B.status, 'ok');
-  assert.equal(r.calls.metrics, 0);
 });
 
-test('métriques refusées (clé fausse) : D avertissement, pas de crash', async () => {
-  const r = await run({ metricsStatus: 401 }, { env: { SUPABASE_SERVICE_KEY: 'mauvaise' } });
+test('niveau disque inconnu : D avertissement', async () => {
+  const r = await run(withDisk('bizarre', 50));
   assert.equal(r.byId.D.status, 'warn');
-  assert.match(r.byId.D.value, /HTTP 401/);
+  assert.equal(r.byId.D.value, 'niveau disque inconnu : bizarre');
+});
+
+test('jamais de requête vers un hôte *.supabase.co, quel que soit le scénario', async () => {
+  const scenarios = [
+    {}, withDisk('avertissement', 70), withDisk('critique', 85), withDisk('bizarre', 1),
+    { healthBody: { db_ok: true } },
+    { healthStatus: 503, healthBody: { db_ok: false } },
+    { healthThrows: true },
+    { pageHtml: EMPTY_HTML },
+  ];
+  for (const sc of scenarios) {
+    const r = await run(sc, { env: { WATCHDOG_TEST: 'true' } });
+    assert.ok(r.calls.hosts.length > 0);
+    assert.deepEqual(r.calls.hosts.filter((h) => h.endsWith('supabase.co')), []);
+  }
 });
 
 test('anti-spam : KO → silence 10 min plus tard → rappel après 1 h → rétabli', async () => {
@@ -270,26 +278,13 @@ test('mode test : message même si tout va bien, avec le résumé des 4 contrôl
   const msg = r.calls.telegram[0].text;
   assert.match(msg, /^🧪 TEST — Watchdog Mulklick/);
   assert.match(msg, /✅ Contrôle A/);
-  assert.match(msg, /⏭️ Contrôle D/);
+  assert.match(msg, /✅ Contrôle D/);
   const off = await run({}, { env: { WATCHDOG_TEST: 'false' } });
   assert.equal(off.calls.telegram.length, 0);
 });
 
-test('parsePrometheus + pickDataVolume : /data préféré, tmpfs ignoré', () => {
-  const s = parsePrometheus(prom({ size: 18e9, avail: 6e9 }));
-  const v = pickDataVolume(s);
-  assert.equal(v.mountpoint, '/data');
-  assert.equal(v.size, 18e9);
-  assert.equal(v.avail, 6e9);
-  const noData = pickDataVolume(parsePrometheus(prom({ size: 18e9, avail: 6e9, mountpoint: '/var/lib/postgresql' })));
-  assert.equal(noData.mountpoint, '/var/lib/postgresql', 'sans /data : le plus grand volume réel');
-  assert.equal(pickDataVolume([]), null);
-});
-
 test('configuration : seuils documentés', () => {
   assert.equal(CONFIG.freshnessMaxHours, 120);
-  assert.equal(CONFIG.diskWarnPct, 70);
-  assert.equal(CONFIG.diskCritPct, 85);
   assert.equal(CONFIG.healthAttempts, 3);
   assert.equal(CONFIG.retryDelayMs, 20_000);
 });

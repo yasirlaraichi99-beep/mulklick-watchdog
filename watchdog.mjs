@@ -1,13 +1,13 @@
 // Watchdog Mulklick — tourne sur GitHub Actions (.github/workflows/watchdog.yml), indépendamment de
-// la base et de l'hébergement du site. Lecture seule : il ne fait que des GET publics (+ l'endpoint
-// de métriques Supabase si le secret SUPABASE_SERVICE_KEY existe) et envoie les alertes sur Telegram.
+// la base et de l'hébergement du site. Lecture seule : il ne fait que des GET publics et envoie les
+// alertes sur Telegram. Aucune clé d'API n'est nécessaire.
 // DÉPÔT PUBLIC : aucun secret ni identifiant interne dans ce code, tout passe par les secrets GitHub.
 //
 // Quatre contrôles :
 //   A — panne      : GET /api/health → 200 et db_ok=true, 3 essais espacés de 20 s.
 //   B — page       : GET /fr/intelligence → les cartes nationales affichent des valeurs.
 //   C — fraîcheur  : age_hours (rendu par /api/health) ≤ seuil.
-//   D — disque     : utilisation du volume de la base (métriques Supabase) < 70 % / 85 %.
+//   D — disque     : disk_level (rendu par /api/health) : ≥ 65 % avertissement, ≥ 80 % critique de 18 GB.
 //
 // Anti-spam : l'état précédent est relu depuis WATCHDOG_STATE_FILE (restauré par le cache Actions).
 // Un message au passage OK → KO, un rappel par heure tant que c'est KO, un message « rétabli » au
@@ -38,9 +38,6 @@ export const CONFIG = {
   // Le scraper tourne lun, mar, jeu, ven à 03:00 Europe/Zurich. Le plus long écart normal entre deux captures est ven → lun = 3 jours.
   // Seuil = cadence + 2 jours = 5 jours.
   freshnessMaxHours: 120,
-  diskCapBytes: 18e9, // 18 GB (plafond du disque de la base), en octets décimaux : alerte un peu plus tôt qu'en GiB
-  diskWarnPct: 70,
-  diskCritPct: 85,
   reminderMs: 55 * 60_000, // « une fois par heure » ; 5 min de marge pour le retard du cron GitHub
 };
 
@@ -169,77 +166,19 @@ export function checkFreshness(healthResult, cfg = CONFIG) {
   return { id: 'C', status: h.age_hours > cfg.freshnessMaxHours ? 'warn' : 'ok', value };
 }
 
-/** Lit une exposition Prometheus texte : [{ name, labels, value }]. */
-export function parsePrometheus(text) {
-  const out = [];
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{(.*)\})?\s+(\S+)/);
-    if (!m) continue;
-    const labels = {};
-    if (m[3]) {
-      for (const lm of m[3].matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"/g)) labels[lm[1]] = lm[2];
-    }
-    const value = Number(m[4]);
-    if (Number.isFinite(value)) out.push({ name: m[1], labels, value });
+/** D — niveau du disque, à partir du JSON du contrôle A (calculé côté site). Aucun appel réseau, aucune clé. */
+export function checkDisk(healthResult) {
+  const h = healthResult?.health;
+  if (!h) return { id: 'D', status: 'skip', value: 'non mesurable (contrôle A en échec)' };
+  const level = h.disk_level;
+  if (level === undefined || level === null) {
+    return { id: 'D', status: 'warn', value: 'niveau disque absent de /api/health' };
   }
-  return out;
-}
-
-/**
- * Choisit le volume de la base parmi les séries node_filesystem_* : /data s'il existe (volume des
- * données Postgres sur Supabase), sinon le plus grand système de fichiers réel (hors tmpfs/overlay).
- * Le point de montage retenu est toujours affiché, pour pouvoir le vérifier au premier vrai run.
- */
-export function pickDataVolume(series) {
-  const size = series.filter((s) => s.name === 'node_filesystem_size_bytes');
-  const avail = series.filter((s) => s.name === 'node_filesystem_avail_bytes');
-  const pseudo = new Set(['tmpfs', 'overlay', 'squashfs', 'devtmpfs', 'ramfs', 'nsfs']);
-  const pairs = size
-    .filter((s) => !pseudo.has(s.labels.fstype))
-    .map((s) => {
-      const a = avail.find(
-        (x) => x.labels.mountpoint === s.labels.mountpoint && x.labels.device === s.labels.device,
-      );
-      return a ? { mountpoint: s.labels.mountpoint ?? '?', size: s.value, avail: a.value } : null;
-    })
-    .filter(Boolean);
-  if (!pairs.length) return null;
-  return pairs.find((p) => p.mountpoint === '/data') ?? pairs.sort((x, y) => y.size - x.size)[0];
-}
-
-/** D — disque, via l'endpoint de métriques Supabase. Sauté proprement sans secret. */
-export async function checkDisk({ fetchImpl, env, cfg = CONFIG }) {
-  const key = env.SUPABASE_SERVICE_KEY;
-  const ref = env.SUPABASE_PROJECT_REF;
-  if (!key) return { id: 'D', status: 'skip', value: 'sauté : secret SUPABASE_SERVICE_KEY absent' };
-  if (!ref || !/^[a-z0-9]{20}$/.test(ref)) return { id: 'D', status: 'skip', value: 'sauté : SUPABASE_PROJECT_REF absent ou invalide' };
-  // https://supabase.com/docs/guides/telemetry/metrics — Basic auth, utilisateur service_role,
-  // mot de passe = clé secrète (sb_secret_…) ou clé service_role (ancien format).
-  const url = `https://${ref}.supabase.co/customer/v1/privileged/metrics`;
-  const auth = 'Basic ' + Buffer.from(`service_role:${key}`).toString('base64');
-  let res;
-  try {
-    res = await fetchWithTimeout(fetchImpl, url, { headers: { authorization: auth } });
-  } catch (e) {
-    return { id: 'D', status: 'warn', value: `métriques illisibles : ${errText(e)}` };
-  }
-  if (res.status !== 200) return { id: 'D', status: 'warn', value: `métriques illisibles : HTTP ${res.status}` };
-  const vol = pickDataVolume(parsePrometheus(await res.text()));
-  if (!vol) return { id: 'D', status: 'warn', value: 'métriques reçues mais aucune série node_filesystem_* exploitable' };
-  const used = vol.size - vol.avail;
-  const pctCap = (used / cfg.diskCapBytes) * 100;
-  const pctFs = (used / vol.size) * 100;
-  // Le plus élevé des deux : le plafond de 18 GB, ET le disque actuel (Supabase passe la base en
-  // lecture seule à 95 % du disque provisionné, même s'il est encore sous le plafond).
-  const pct = Math.max(pctCap, pctFs);
-  const gb = (b) => (b / 1e9).toFixed(1).replace('.', ',');
-  const value =
-    `${pct.toFixed(0)} % — ${gb(used)} GB utilisés (${pctCap.toFixed(0)} % de 18 GB, ` +
-    `${pctFs.toFixed(0)} % du disque actuel de ${gb(vol.size)} GB, volume ${vol.mountpoint})`;
-  const status = pct >= cfg.diskCritPct ? 'crit' : pct >= cfg.diskWarnPct ? 'warn' : 'ok';
-  return { id: 'D', status, value, pct };
+  const value = `≈ ${h.disk_pct} % de 18 GB (taille de la base, hors journaux Postgres ; seuils 65 / 80 %)`;
+  if (level === 'ok') return { id: 'D', status: 'ok', value };
+  if (level === 'avertissement') return { id: 'D', status: 'warn', value };
+  if (level === 'critique') return { id: 'D', status: 'crit', value };
+  return { id: 'D', status: 'warn', value: `niveau disque inconnu : ${level}` };
 }
 
 // ───────────────────────────── décision + messages ─────────────────────────────
@@ -336,12 +275,12 @@ export async function sendTelegram({ fetchImpl, token, chatId, text }) {
 // ───────────────────────────── orchestration ─────────────────────────────
 
 export async function runChecks({ fetchImpl, sleep, env, cfg = CONFIG }) {
-  const [a, b, d] = await Promise.all([
+  const [a, b] = await Promise.all([
     checkHealth({ fetchImpl, sleep, cfg }),
     checkPage({ fetchImpl, sleep, cfg }),
-    checkDisk({ fetchImpl, env, cfg }),
   ]);
   const c = checkFreshness(a, cfg);
+  const d = checkDisk(a);
   return [a, b, c, d];
 }
 
