@@ -6,6 +6,10 @@ name: Watchdog Mulklick
 # DÉPÔT PUBLIC : les minutes Actions y sont gratuites. Aucun secret dans ce fichier ; tout passe
 # par les secrets du dépôt (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID). Les journaux des runs sont publics : le script n'y écrit que des statuts.
 # Aucun déclencheur pull_request : un fork ne peut rien lancer ici.
+#
+# Déclencheur principal : cron-job.org appelle workflow_dispatch toutes les 10 minutes (le cron
+# GitHub ci-dessous ne se déclenche pas, problème GitHub connu depuis fin octobre 2026). Le cron
+# reste en place : s'il revient, il double les passages sans doubler les alertes.
 
 on:
   schedule:

@@ -5,10 +5,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runOnce, decide, CONFIG } from './watchdog.mjs';
+import { runOnce, decide, zurichNow, CONFIG } from './watchdog.mjs';
 
-const T0 = Date.UTC(2026, 10, 19, 14, 0); // 19.11.2026 14:00 UTC
+const T0 = Date.UTC(2026, 10, 19, 14, 0); // 19.11.2026 14:00 UTC (15:00 heure suisse)
 const MIN = 60_000;
+// État de départ par défaut : le bilan du 19.11 a déjà été envoyé, pour que les tests d'alerte
+// ne reçoivent pas en plus le bilan du matin (testé à part, plus bas).
+const DAILY_DONE = Object.freeze({ version: 1, checks: {}, lastDailyDate: '2026-11-19', passesSinceDaily: 0 });
 
 const HEALTHY_HTML = `<html>${'<polyline data-spark="" points="0,1 2,3"></polyline>'.repeat(8)}</html>`;
 const EMPTY_HTML = `<html>${'<div>Aucune valeur actuelle</div>'.repeat(8)}</html>`;
@@ -57,7 +60,7 @@ const BASE_ENV = {
   TELEGRAM_CHAT_ID: '42',
 };
 
-async function run(site, { env = {}, prevState = null, nowMs = T0 } = {}) {
+async function run(site, { env = {}, prevState = DAILY_DONE, nowMs = T0 } = {}) {
   const net = fakeNet(site);
   const sleeps = [];
   const logs = [];
@@ -108,7 +111,7 @@ test('A échoue deux fois puis répond : pas d’alerte', async () => {
     if (String(url).includes('/api/health') && n++ < 2) return jsonRes(502, null);
     return net.fetchImpl(url, init);
   };
-  const out = await runOnce({ fetchImpl: flaky, sleep: async () => {}, env: BASE_ENV, prevState: null, nowMs: T0, log: () => {} });
+  const out = await runOnce({ fetchImpl: flaky, sleep: async () => {}, env: BASE_ENV, prevState: DAILY_DONE, nowMs: T0, log: () => {} });
   assert.equal(out.results.find((x) => x.id === 'A').status, 'ok');
   assert.equal(net.calls.telegram.length, 0);
 });
@@ -263,7 +266,7 @@ test('plusieurs contrôles KO au même passage : un seul envoi Telegram groupé'
 test('échec Telegram : job en échec, état non avancé, jeton jamais journalisé', async () => {
   const r = await run({ healthStatus: 503, healthBody: { db_ok: false }, telegramFails: true });
   assert.equal(r.exitCode, 1);
-  assert.deepEqual(r.stateToWrite, { version: 1, checks: {} });
+  assert.deepEqual(r.stateToWrite, DAILY_DONE);
   const all = r.logs.join('\n');
   assert.match(all, /ÉCHEC de l'envoi Telegram : Telegram : HTTP 401 — Unauthorized/);
   assert.ok(!all.includes('TEST-TOKEN-NOT-REAL'), 'le jeton ne doit jamais apparaître dans les logs');
@@ -283,7 +286,81 @@ test('mode test : message même si tout va bien, avec le résumé des 4 contrôl
   assert.equal(off.calls.telegram.length, 0);
 });
 
+// ───────────────────────────── bilan du matin ─────────────────────────────
+
+const H = 3_600_000;
+const NOV20_0750_CH = Date.UTC(2026, 10, 20, 6, 50); // 07:50 heure suisse (UTC+1 en hiver)
+const NOV20_0800_CH = Date.UTC(2026, 10, 20, 7, 0); // 08:00 heure suisse
+
+test('heure suisse : hiver UTC+1, été UTC+2', () => {
+  assert.deepEqual(zurichNow(NOV20_0800_CH), { date: '2026-11-20', hour: 8, label: '20.11.2026 08:00' });
+  assert.equal(zurichNow(Date.UTC(2026, 6, 1, 6, 0)).hour, 8, '1er juillet 06:00 UTC = 08:00 heure d’été');
+  assert.equal(zurichNow(Date.UTC(2026, 10, 19, 23, 30)).date, '2026-11-20', 'minuit suisse avant minuit UTC');
+});
+
+test('bilan : rien avant 08:00, puis un seul bilan à 08:00 avec heure du passage et disque', async () => {
+  const before = await run({}, { nowMs: NOV20_0750_CH });
+  assert.equal(before.calls.telegram.length, 0, 'pas de bilan avant 08:00');
+  assert.equal(before.stateToWrite.lastDailyDate, '2026-11-19');
+
+  const at8 = await run({}, { prevState: before.stateToWrite, nowMs: NOV20_0800_CH });
+  assert.equal(at8.calls.telegram.length, 1);
+  const msg = at8.calls.telegram[0].text;
+  assert.match(msg, /^☀️ BILAN DU MATIN — tout va bien/);
+  assert.match(msg, /Dernier passage : 20\.11\.2026 08:00 \(heure suisse\)/);
+  assert.match(msg, /Disque : ok, ≈ 50 % de 18 GB/);
+  assert.match(msg, /Passages depuis le bilan précédent : 2 \(≈ 144 attendus par jour\)/);
+  assert.match(msg, /Si ce bilan manque un matin, le watchdog est arrêté/);
+  assert.equal(at8.stateToWrite.lastDailyDate, '2026-11-20');
+  assert.equal(at8.stateToWrite.passesSinceDaily, 0);
+
+  const at810 = await run({}, { prevState: at8.stateToWrite, nowMs: NOV20_0800_CH + 10 * MIN });
+  assert.equal(at810.calls.telegram.length, 0, 'un seul bilan par jour');
+  assert.equal(at810.stateToWrite.passesSinceDaily, 1);
+
+  const nextDay = await run({}, { prevState: at810.stateToWrite, nowMs: NOV20_0800_CH + 24 * H });
+  assert.equal(nextDay.calls.telegram.length, 1, 'nouveau bilan le lendemain');
+  assert.match(nextDay.calls.telegram[0].text, /Dernier passage : 21\.11\.2026 08:00/);
+});
+
+test('bilan pendant une alerte : envoyé quand même, avec le contrôle en alerte', async () => {
+  const r = await run(
+    { healthBody: { db_ok: true, latest_capture: '2026-11-20', age_hours: 8, response_ms: 40, disk_level: 'avertissement', disk_pct: 70 } },
+    { prevState: { ...DAILY_DONE, checks: { D: { status: 'warn', since: NOV20_0800_CH - 2 * H, lastAlertAt: NOV20_0800_CH - 30 * MIN } } }, nowMs: NOV20_0800_CH },
+  );
+  assert.equal(r.calls.telegram.length, 1, 'bilan seul : le rappel horaire n’est pas encore dû');
+  const msg = r.calls.telegram[0].text;
+  assert.match(msg, /^☀️ BILAN DU MATIN — watchdog actif, 1 contrôle en alerte/);
+  assert.match(msg, /Disque : avertissement, ≈ 70 % de 18 GB/);
+  assert.match(msg, /🟠 Contrôle D/);
+});
+
+test('bilan avec site injoignable : disque « non mesuré », alerte et bilan dans le même envoi', async () => {
+  const r = await run({ healthStatus: 503, healthBody: { db_ok: false } }, { nowMs: NOV20_0800_CH });
+  assert.equal(r.calls.telegram.length, 1);
+  const msg = r.calls.telegram[0].text;
+  assert.match(msg, /🔴 CRITIQUE — Contrôle A/);
+  assert.match(msg, /☀️ BILAN DU MATIN — watchdog actif, 1 contrôle en alerte/);
+  assert.match(msg, /Disque : non mesuré \(site injoignable\)/);
+});
+
+test('bilan + échec Telegram : la date n’avance pas, le bilan repart au passage suivant', async () => {
+  const fail = await run({ telegramFails: true }, { nowMs: NOV20_0800_CH });
+  assert.equal(fail.exitCode, 1);
+  assert.equal(fail.stateToWrite.lastDailyDate, '2026-11-19');
+  const retry = await run({}, { prevState: fail.stateToWrite, nowMs: NOV20_0800_CH + 10 * MIN });
+  assert.equal(retry.calls.telegram.length, 1);
+  assert.match(retry.calls.telegram[0].text, /^☀️ BILAN DU MATIN/);
+});
+
+test('premier passage sans état (cache vide) après 08:00 : bilan immédiat', async () => {
+  const r = await run({}, { prevState: null, nowMs: NOV20_0800_CH + 3 * H });
+  assert.equal(r.calls.telegram.length, 1);
+  assert.match(r.calls.telegram[0].text, /Passages depuis le bilan précédent : 1/);
+});
+
 test('configuration : seuils documentés', () => {
+  assert.equal(CONFIG.dailyHourZurich, 8);
   assert.equal(CONFIG.freshnessMaxHours, 120);
   assert.equal(CONFIG.healthAttempts, 3);
   assert.equal(CONFIG.retryDelayMs, 20_000);
