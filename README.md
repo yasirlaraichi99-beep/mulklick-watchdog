@@ -51,6 +51,25 @@ secret : jetons et identifiants vivent uniquement dans les secrets du dépôt.
   alertes n'ont pas pu partir). Le contrôleur alerte, lui, si le watchdog se tait ; le watchdog
   alerte (🔴) si le contrôleur refuse ses signaux 3 fois de suite.
 
+## Prise en charge des incidents (partie 7) — inerte sans `GARDE_ACTIVE`
+
+Quand Yasir pose la variable de dépôt `GARDE_ACTIVE` = `true` (après le banc d'essai réussi et la
+garde du cockpit allumée) :
+
+- chaque incident a **son sujet** dans le groupe Telegram « Incidents Mulklick » ; le watchdog le
+  crée, y poste ses messages et **signale l'incident au cockpit**, qui tire l'agent de garde
+  (routine Claude) puis, s'il se tait ou échoue, l'agent relais automatique ;
+- le watchdog vérifie **lui-même** les délais : pris en charge en 5 min (urgent) / 30 min
+  (important), diagnostic en 60 min / 24 h. Personne à temps (ou cockpit injoignable) →
+  🚨 **URGENCE ABSOLUE**, sonore, répétée toutes les 10 min jusqu'à ce que Yasir réponde dans le
+  sujet, avec l'agent attendu et la raison connue de son silence ;
+- secrets : `TELEGRAM_INCIDENTS_CHAT_ID`, `COCKPIT_API_URL`, `COCKPIT_WATCHDOG_TOKEN`,
+  `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` (ces trois derniers n'ouvrent que les deux
+  routes du watchdog au cockpit).
+
+Banc d'essai : `node banc-garde.mjs` (rapport scénario par scénario, échecs en premier) ; rejoué
+par GitHub à chaque PR (workflow « Tests et banc d'essai »).
+
 ## Déclenchement
 
 - **cron-job.org** appelle toutes les 10 minutes l'API `workflow_dispatch` de ce workflow, avec un

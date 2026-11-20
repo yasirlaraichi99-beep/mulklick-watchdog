@@ -55,6 +55,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # Facultatif : contrôleur de vie externe (ping à chaque passage). Absent = ignoré.
           HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+          # Partie 7 — la garde. INERTE tant que la variable de dépôt GARDE_ACTIVE n'est pas « true »
+          # (posée par Yasir, après le banc d'essai réussi et la garde du cockpit allumée).
+          GARDE_ACTIVE: ${{ vars.GARDE_ACTIVE }}
+          TELEGRAM_INCIDENTS_CHAT_ID: ${{ secrets.TELEGRAM_INCIDENTS_CHAT_ID }}
+          COCKPIT_API_URL: ${{ secrets.COCKPIT_API_URL }}
+          COCKPIT_WATCHDOG_TOKEN: ${{ secrets.COCKPIT_WATCHDOG_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           WATCHDOG_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
           WATCHDOG_STATE_FILE: .watchdog-state/state.json
 

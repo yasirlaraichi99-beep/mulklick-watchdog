@@ -37,6 +37,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { gardeActive, gardeAvant, destination, signaler, rattraper, planDelais } from './garde.mjs';
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -70,7 +71,7 @@ export const CONFIG = {
   renotifyMs: { urgent: null, important: null }, // null = jamais : répétition seulement si ça s'aggrave
   soundCapPerDay: 3, // messages sonores par jour (heure suisse), hors panne en cours
   weeklyHourZurich: 8, // résumé du lundi, à partir de 08:00 heure suisse
-  runEveryMs: 10 * MIN,
+  runEveryMs: 5 * MIN, // cadence cron-job.org (décision 4a : 5 min, pour tenir la prise en charge en 5 min)
   gapInfoMs: 25 * MIN, // trou entre deux passages noté pour le résumé du lundi
   gapImportantMs: 2 * HOUR, // watchdog arrêté plus de 2 h : message IMPORTANT à la reprise
 
@@ -94,6 +95,7 @@ const TITLES = {
   disque: 'Disque de la base',
   disque_lecture: 'Lecture du niveau du disque',
   relais: 'Contrôleur de vie du watchdog',
+  garde: 'Garde du cockpit (agents)',
 };
 
 const ACTIONS = {
@@ -103,6 +105,7 @@ const ACTIONS = {
   disque: 'libérer de la place dans la base (rétention des archives de scraping) ou agrandir le disque avant la restriction.',
   disque_lecture: 'vérifier /api/health (champs disk_level, disk_pct) et le dernier déploiement du site.',
   relais: 'vérifier le compte du contrôleur de vie ; le watchdog, lui, continue de surveiller.',
+  garde: 'vérifier le cockpit (Railway, Cloudflare Access, jetons du watchdog) : sans lui, aucun agent ne peut prendre un incident.',
 };
 
 const ICON = { urgent: '🔴', important: '🟠' };
@@ -449,6 +452,16 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
     }
   }
 
+  // Garde du cockpit (seulement quand GARDE_ACTIVE) : injoignable = les agents ne peuvent rien prendre.
+  const g = by.G;
+  if (g && g.status !== 'ok') {
+    out.push({
+      key: 'garde', level: 'important', panne: false, rank: 1, confirm: true,
+      what: `La garde du cockpit est injoignable (${g.value}).`,
+      gravity: 'anomalie confirmée : aucun agent ne peut prendre un incident ; le watchdog, lui, continue.',
+    });
+  }
+
   if (state.heartbeatFails >= cfg.heartbeatFailRuns) {
     out.push({
       key: 'relais', level: 'urgent', panne: false, rank: 3,
@@ -584,11 +597,12 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
       const record = {
         level: inc.level, rank: inc.rank, panne: inc.panne, openedAt: recur ? closed.openedAt : pend.first,
         notifiedAt: nowMs, okSince: null, lowerRuns: 0, recurrences: recur ? (closed.recurrences ?? 0) + 1 : 0,
-        mutedByCap: false, pct: inc.pct,
+        mutedByCap: false, pct: inc.pct, what: inc.what,
       };
       msgs.push({
         text: incidentText(recur ? 'recur' : 'open', inc, nowMs, pend.first),
         sound: !recur && inc.level === 'urgent', panne: inc.panne, key: inc.key,
+        kind: recur ? 'recur' : 'open', inc, since: pend.first,
         commit: (st) => {
           st.incidents[inc.key] = { ...record };
           delete st.pending[inc.key];
@@ -605,6 +619,7 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
       prev.lowerRuns = 0;
       msgs.push({
         text: incidentText('worse', inc, nowMs, prev.openedAt), sound: inc.level === 'urgent', panne: inc.panne, key: inc.key,
+        kind: 'worse', inc, since: prev.openedAt,
         commit: (st) => Object.assign(st.incidents[inc.key], { level: inc.level, rank: inc.rank, notifiedAt: nowMs, mutedByCap: false }),
       });
     } else if (inc.rank < prev.rank) {
@@ -614,6 +629,7 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
         if (inc.level !== prev.level) {
           msgs.push({
             text: incidentText('better', inc, nowMs, prev.openedAt), sound: false, panne: inc.panne, key: inc.key,
+            kind: 'better', inc, since: prev.openedAt,
             commit: (st) => Object.assign(st.incidents[inc.key], { level: inc.level, rank: inc.rank, notifiedAt: nowMs, lowerRuns: 0, mutedByCap: false }),
           });
         } else {
@@ -628,6 +644,7 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
       if (capReplay || (every && nowMs - prev.notifiedAt >= every)) {
         msgs.push({
           text: incidentText('remind', inc, nowMs, prev.openedAt), sound: inc.level === 'urgent', panne: inc.panne, key: inc.key,
+          kind: 'remind', inc, since: prev.openedAt,
           commit: (st) => Object.assign(st.incidents[inc.key], { notifiedAt: nowMs, mutedByCap: false }),
         });
       }
@@ -645,6 +662,7 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
       const { okSince, openedAt, rank, recurrences } = prev;
       msgs.push({
         text: closeText(key, okSince, openedAt), sound: false, panne: false, key,
+        kind: 'close', inc: { key, level: prev.level, what: `${TITLES[key]} : revenu à la normale.`, gravity: 'aucune.' }, since: openedAt,
         commit: (st) => {
           delete st.incidents[key];
           st.closed[key] = { at: nowMs, openedAt, rank, recurrences: recurrences ?? 0 };
@@ -713,17 +731,17 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
 
 // ───────────────────────────── Telegram ─────────────────────────────
 
-export async function sendTelegram({ fetchImpl, token, chatId, text, silent = false }) {
-  if (!token || !chatId) throw new Error('Telegram : TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID absent');
+/** Appel à l'API Telegram du bot. Rend `result`. Jamais l'URL (elle contient le jeton) dans une erreur. */
+export async function telegramApi({ fetchImpl, token, method, payload }) {
+  if (!token) throw new Error('Telegram : TELEGRAM_BOT_TOKEN absent');
   let res;
   try {
-    res = await fetchWithTimeout(fetchImpl, `https://api.telegram.org/bot${token}/sendMessage`, {
+    res = await fetchWithTimeout(fetchImpl, `https://api.telegram.org/bot${token}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true, disable_notification: silent }),
+      body: JSON.stringify(payload),
     });
   } catch (e) {
-    // Jamais l'URL (elle contient le jeton) : seulement la nature de l'erreur.
     throw new Error(`Telegram : ${errText(e)}`);
   }
   let body = null;
@@ -736,6 +754,16 @@ export async function sendTelegram({ fetchImpl, token, chatId, text, silent = fa
     const desc = body && typeof body.description === 'string' ? body.description.slice(0, 200) : 'réponse illisible';
     throw new Error(`Telegram : HTTP ${res.status} — ${desc}`);
   }
+  return body.result;
+}
+
+/** Envoie un message (dans un sujet de forum si `threadId`). Rend l'identifiant du message. */
+export async function sendTelegram({ fetchImpl, token, chatId, text, silent = false, threadId = null }) {
+  if (!token || !chatId) throw new Error('Telegram : TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID absent');
+  const payload = { chat_id: chatId, text, disable_web_page_preview: true, disable_notification: silent };
+  if (threadId) payload.message_thread_id = threadId;
+  const result = await telegramApi({ fetchImpl, token, method: 'sendMessage', payload });
+  return result && typeof result.message_id === 'number' ? result.message_id : null;
 }
 
 /** Signal de vie vers le contrôleur externe ; « /fail » si ce passage n'a pas pu envoyer ses alertes. */
@@ -766,27 +794,62 @@ export async function runChecks({ fetchImpl, sleep, cfg = CONFIG }) {
  */
 export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, nowMs = Date.now(), log = console.log, cfg = CONFIG }) {
   const results = await runChecks({ fetchImpl, sleep, cfg });
+  const tg = { api: (method, payload) => telegramApi({ fetchImpl, token: env.TELEGRAM_BOT_TOKEN, method, payload }) };
+
+  // Partie 7 : la garde (inerte sans GARDE_ACTIVE). Elle lit le cockpit et les réponses de Yasir
+  // AVANT de décider, et ajoute le contrôle « G » (cockpit joignable).
+  const garde = gardeActive(env);
+  let pre = null;
+  if (garde) {
+    pre = await gardeAvant({ fetchImpl, env, prevGarde: prevState && prevState.garde, tg, log });
+    results.push(pre.resultat);
+  }
   for (const r of results) log(`[${r.id}] ${r.status.toUpperCase()} — ${r.value}`);
 
   const { state, messages } = planRun(prevState, results, nowMs, env, cfg);
+  if (garde) state.garde = pre.garde;
+  else delete state.garde;
   if (String(env.WATCHDOG_TEST).toLowerCase() === 'true') {
     messages.push({ text: testSummary(results, nowMs), sound: false, panne: false, key: 'test', commit: () => {} });
   }
+  const versGarde = garde && pre.err !== 'configuration incomplète';
 
   const sent = [];
   let failed = false;
   for (const m of messages) {
+    let dest = { chatId: env.TELEGRAM_CHAT_ID, threadId: null };
+    let messageId = null;
     try {
-      await sendTelegram({ fetchImpl, token: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID, text: m.text, silent: !m.sound });
+      if (versGarde) dest = await destination({ tg, env, garde: state.garde, m, nowMs });
+      messageId = await sendTelegram({ fetchImpl, token: env.TELEGRAM_BOT_TOKEN, chatId: dest.chatId, threadId: dest.threadId, text: m.text, silent: !m.sound });
     } catch (e) {
       log(`ÉCHEC de l'envoi Telegram : ${e.message}`);
       failed = true;
       break;
     }
     m.commit(state);
-    sent.push({ text: m.text, silent: !m.sound });
+    sent.push({ text: m.text, silent: !m.sound, threadId: dest.threadId });
+    if (versGarde && m.kind) {
+      await signaler({ fetchImpl, env, garde: state.garde, m: { ...m, action: ACTIONS[m.key] }, dest, messageId, log });
+    }
   }
-  log(messages.length ? `Telegram : ${sent.length}/${messages.length} message(s) envoyé(s).` : 'Aucun message à envoyer.');
+
+  // Partie 7 : rattrapage des signaux, puis les délais de prise en charge (urgence absolue).
+  if (versGarde && !failed) {
+    await rattraper({ fetchImpl, env, garde: state.garde, log });
+    for (const d of planDelais({ garde: state.garde, incidents: state.incidents, list: pre.list, err: pre.err, nowMs })) {
+      try {
+        await sendTelegram({ fetchImpl, token: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_INCIDENTS_CHAT_ID, threadId: d.threadId, text: d.text, silent: !d.sound });
+      } catch (e) {
+        log(`ÉCHEC de l'envoi Telegram : ${e.message}`);
+        failed = true;
+        break;
+      }
+      d.commit(state.garde);
+      sent.push({ text: d.text, silent: !d.sound, threadId: d.threadId });
+    }
+  }
+  log(sent.length || messages.length ? `Telegram : ${sent.length} message(s) envoyé(s).` : 'Aucun message à envoyer.');
 
   if (env.HEARTBEAT_URL) {
     const ok = await pingHeartbeat(fetchImpl, env.HEARTBEAT_URL, !failed);

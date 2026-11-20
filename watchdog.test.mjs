@@ -88,14 +88,14 @@ async function run(site, { env = {}, prevState = null, nowMs = T0 } = {}) {
  * Banc d'essai : `runs` passages toutes les 10 minutes ; `site(i, t)` décrit l'état simulé ;
  * `skip(i)` saute un passage (watchdog arrêté).
  */
-async function simulate({ start, runs, site = () => ({}), env = {}, prevState = null, skip = () => false }) {
+async function simulate({ start, runs, site = () => ({}), env = {}, prevState = null, skip = () => false, every = 10 * MIN }) {
   let state = prevState;
   const sent = [];
   let pings = 0;
   let failedRuns = 0;
   for (let i = 0; i < runs; i += 1) {
     if (skip(i)) continue;
-    const t = start + i * 10 * MIN;
+    const t = start + i * every;
     const r = await run(site(i, t), { env, prevState: state, nowMs: t });
     state = r.state;
     if (r.exitCode !== 0) failedRuns += 1;
@@ -393,15 +393,15 @@ test('heure suisse et clé de semaine', () => {
 // ───────────────────────────── banc d'essai : bruit ─────────────────────────────
 
 test('BANC — semaine sans incident : 0 message sonore, 1 seul silencieux (résumé du lundi)', async () => {
-  const s = await simulate({ start: TUE_17_MIDNIGHT_CH, runs: 7 * 144, env: HB_ENV });
+  const s = await simulate({ start: TUE_17_MIDNIGHT_CH, runs: 7 * 288, env: HB_ENV, every: 5 * MIN });
   assert.equal(s.sound.length, 0);
   assert.equal(s.silent.length, 1);
   const w = s.silent[0];
   assert.equal(new Date(w.t).toISOString(), '2026-11-23T07:00:00.000Z', 'lundi 08:00 heure suisse');
   assert.equal(lines(w.text), 3);
-  // Du mardi 00:00 au lundi 08:00 inclus : 6 j 8 h = 912 intervalles, 913 passages.
-  assert.match(w.text, /^📋 Semaine du 17\.11 au 23\.11 : aucun incident\.\nSurveillance : 913 passages sur ≈ 913 · disque ≈ 50 % de 18 GB \(stable\) · dernière capture 2026-11-19\.\nAction : aucune\.$/);
-  assert.equal(s.pings, 7 * 144, 'un signal de vie par passage');
+  // Un passage toutes les 5 min, du mardi 00:00 au lundi 08:00 inclus : 1824 intervalles, 1825 passages.
+  assert.match(w.text, /^📋 Semaine du 17\.11 au 23\.11 : aucun incident\.\nSurveillance : 1825 passages sur ≈ 1825 · disque ≈ 50 % de 18 GB \(stable\) · dernière capture 2026-11-19\.\nAction : aucune\.$/);
+  assert.equal(s.pings, 7 * 288, 'un signal de vie par passage');
   assert.equal(s.failedRuns, 0);
 });
 

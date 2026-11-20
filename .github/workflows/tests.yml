@@ -1,0 +1,27 @@
+name: Tests et banc d'essai
+
+# Rejoue les tests du watchdog (règles de communication, partie 6) et le banc d'essai de la
+# partie 7 (prise en charge des incidents) à chaque PR et à chaque push sur main. Réponses
+# réseau simulées : aucun secret, aucun vrai message.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tests (partie 6) et scénarios (partie 7)
+        run: node --test watchdog.test.mjs garde.test.mjs
+      - name: Rapport du banc d'essai de la partie 7
+        if: always()
+        run: node banc-garde.mjs >> "$GITHUB_STEP_SUMMARY"
