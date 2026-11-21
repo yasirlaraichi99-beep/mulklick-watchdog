@@ -13,7 +13,7 @@ secret : jetons et identifiants vivent uniquement dans les secrets du dépôt.
 | | Contrôle | Ce qui est mesuré |
 |---|---|---|
 | A | `GET /api/health` du site | statut 200 et `db_ok` vrai, 3 essais espacés de 20 s |
-| B | `GET /fr/intelligence` (anti-cache) | cartes nationales chiffrées (« Aucune valeur actuelle » = carte vide) |
+| B | `GET /fr/intelligence` (anti-cache) | cartes nationales avec donnée. Deux formats : `data-card-state="value"`/`"reserved"` (donnée en clair ou masquée aux visiteurs non connectés) contre `"empty"` (aucune donnée) ; à défaut, ancien comptage `data-spark=""` / « Aucune valeur actuelle ». Le watchdog reste anonyme (aucune session ni clé) |
 | C | fraîcheur (`age_hours` de /api/health) | ≤ 120 h (scraper lun/mar/jeu/ven, écart max ven → lun 3 j, + 2 j) |
 | D | disque (`disk_level`, `disk_pct` de /api/health, aucune clé) | seuils 65 / 80 / 90 % de 18 GB + projection du remplissage |
 
