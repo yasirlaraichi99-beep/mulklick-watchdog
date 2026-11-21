@@ -55,6 +55,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # Facultatif : contrôleur de vie externe (ping à chaque passage). Absent = ignoré.
           HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+          # Mode secours : signe de vie de la surveillance principale (route publique /health du
+          # cockpit). Présent → ce workflow se tait tant que le cockpit tourne, et alerte sinon.
+          PRINCIPAL_HEALTH_URL: ${{ secrets.PRINCIPAL_HEALTH_URL }}
           WATCHDOG_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
           WATCHDOG_STATE_FILE: .watchdog-state/state.json
 

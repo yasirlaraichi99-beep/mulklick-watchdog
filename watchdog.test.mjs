@@ -65,6 +65,11 @@ function fakeNet(site) {
       assert.ok(u.searchParams.get('wd'), 'paramètre anti-cache attendu sur la page');
       return textRes(site.pageStatus ?? 200, site.pageHtml ?? HEALTHY_HTML);
     }
+    if (u.hostname === 'cockpit.example' && u.pathname === '/health') {
+      calls.principal = (calls.principal ?? 0) + 1;
+      if (site.principalThrows) throw Object.assign(new Error('x'), { name: 'TypeError' });
+      return jsonRes(site.principalStatus ?? 200, site.principal ?? { status: 'ok' });
+    }
     throw new Error(`URL inattendue dans un test : ${u.hostname}${u.pathname}`);
   };
   return { fetchImpl, calls };
@@ -542,4 +547,65 @@ test('configuration : seuils documentés', () => {
   assert.equal(CONFIG.retryDelayMs, 20_000);
   assert.equal(CONFIG.soundCapPerDay, 3);
   assert.deepEqual(CONFIG.renotifyMs, { urgent: null, important: null });
+});
+
+// ───────────────────────────── mode secours (21.11.2026) ─────────────────────────────
+// La surveillance principale tourne dans le cockpit et publie son signe de vie sur /health.
+// Le workflow GitHub n'est plus que le secours : il lit ce signe de vie quand il passe.
+
+const SECOURS_ENV = { PRINCIPAL_HEALTH_URL: 'https://cockpit.example/health' };
+const vivant = (ms) => ({ status: 'ok', surveillance_site: { actif: true, dernier_passage: new Date(ms).toISOString(), passages_recents: [] } });
+
+test('SECOURS — cockpit vivant : aucun contrôle du site, aucun message', async () => {
+  const r = await run({ principal: vivant(T0 - 3 * MIN) }, { env: SECOURS_ENV });
+  assert.equal(r.calls.principal, 1);
+  assert.equal(r.calls.health, 0, 'le site n’est pas contrôlé ici : le cockpit le fait');
+  assert.equal(r.calls.page, 0);
+  assert.equal(r.calls.telegram.length, 0);
+  assert.equal(r.byId.P.status, 'ok');
+});
+
+test('SECOURS — cockpit muet depuis 40 min : alerte URGENTE sonore + le secours fait les contrôles', async () => {
+  const r = await run({ principal: vivant(T0 - 40 * MIN) }, { env: SECOURS_ENV });
+  assert.ok(r.calls.health >= 1, 'le secours contrôle le site lui-même');
+  assert.equal(r.calls.telegram.length, 1);
+  assert.equal(r.calls.telegram[0].silent, false);
+  assert.match(r.calls.telegram[0].text, /^🔴 URGENT — La surveillance principale \(cockpit\) ne tourne plus : dernier passage il y a 40 min/);
+  assert.match(r.calls.telegram[0].text, /\nAction : Railway → service admin-backend/);
+});
+
+test('SECOURS — cockpit injoignable, ou joignable sans signe de vie : alerte', async () => {
+  const a = await run({ principalThrows: true }, { env: SECOURS_ENV });
+  assert.match(a.calls.telegram[0].text, /ne tourne plus : cockpit injoignable \(erreur réseau\)/);
+  const b = await run({ principal: { status: 'ok' } }, { env: SECOURS_ENV });
+  assert.match(b.calls.telegram[0].text, /sans signe de vie de la surveillance/);
+  const c = await run({ principal: { status: 'ok', surveillance_site: { actif: false, dernier_passage: null } } }, { env: SECOURS_ENV });
+  assert.match(c.calls.telegram[0].text, /surveillance désactivée dans le cockpit/);
+});
+
+test('SECOURS — cockpit arrêté ET base en panne : deux causes, deux messages sonores', async () => {
+  const r = await run({ ...DOWN, principal: vivant(T0 - 2 * H) }, { env: SECOURS_ENV });
+  assert.equal(r.calls.telegram.length, 2);
+  assert.ok(r.calls.telegram.every((m) => !m.silent));
+  assert.ok(r.calls.telegram.some((m) => /surveillance principale/.test(m.text)));
+  assert.ok(r.calls.telegram.some((m) => /Base de données ou \/api\/health injoignable/.test(m.text)));
+});
+
+test('SECOURS — le cockpit revient : passation silencieuse, clôture silencieuse 1 h plus tard', async () => {
+  const mort = await run({ ...DOWN, principal: vivant(T0 - 2 * H) }, { env: SECOURS_ENV });
+  assert.equal(mort.calls.telegram.length, 2);
+  const retour = await run({ ...DOWN, principal: vivant(T0 + 3 * H - MIN) }, { env: SECOURS_ENV, prevState: mort.state, nowMs: T0 + 3 * H });
+  assert.equal(retour.calls.telegram.length, 0, 'cockpit vivant : la base en panne est son affaire, pas de doublon');
+  assert.equal(retour.state.incidents.base, undefined, 'incident du site rendu au cockpit');
+  const plusTard = await run({ principal: vivant(T0 + 5 * H - MIN) }, { env: SECOURS_ENV, prevState: retour.state, nowMs: T0 + 5 * H });
+  assert.equal(plusTard.calls.telegram.length, 1);
+  assert.equal(plusTard.calls.telegram[0].silent, true);
+  assert.match(plusTard.calls.telegram[0].text, /^🟢 RÉSOLU — Surveillance principale \(cockpit\)/);
+});
+
+test('SECOURS — ni résumé du lundi ni message « n’a pas tourné » (le secours passe rarement, c’est normal)', async () => {
+  const r1 = await run({ principal: vivant(T0 - MIN) }, { env: SECOURS_ENV, nowMs: T0 });
+  const lundi = Date.UTC(2026, 10, 23, 7, 0); // lundi 08:00 heure suisse, 3 jours plus tard
+  const r2 = await run({ principal: vivant(lundi - MIN) }, { env: SECOURS_ENV, prevState: r1.state, nowMs: lundi });
+  assert.equal(r2.calls.telegram.length, 0);
 });

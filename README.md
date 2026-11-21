@@ -8,6 +8,17 @@ site.
 Le dépôt est public parce que les minutes GitHub Actions y sont gratuites. Il ne contient aucun
 secret : jetons et identifiants vivent uniquement dans les secrets du dépôt.
 
+## Rôle depuis le 21.11.2026 : SECOURS de la surveillance du cockpit
+
+La surveillance principale tourne dans le cockpit (backend sur Railway), **toutes les 5 minutes**,
+sans dépendre de la base ni de Vercel, et publie son signe de vie sur sa route publique `/health`.
+Ce workflow GitHub n'est plus que le **secours** (secret `PRINCIPAL_HEALTH_URL`) :
+
+- cockpit vivant (dernier passage il y a moins de 15 min) : il ne contrôle pas le site et se tait ;
+- cockpit muet, injoignable ou désactivé : 🔴 alerte « La surveillance principale ne tourne plus »,
+  puis il fait lui-même les contrôles A à D avec les mêmes règles de communication ;
+- ni résumé du lundi ni message « n'a pas tourné » ici : c'est le cockpit qui s'en charge.
+
 ## Contrôles
 
 | | Contrôle | Ce qui est mesuré |
