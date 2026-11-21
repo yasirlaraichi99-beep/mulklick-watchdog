@@ -19,6 +19,13 @@ Ce workflow GitHub n'est plus que le **secours** (secret `PRINCIPAL_HEALTH_URL`)
   puis il fait lui-même les contrôles A à D avec les mêmes règles de communication ;
 - ni résumé du lundi ni message « n'a pas tourné » ici : c'est le cockpit qui s'en charge.
 
+## Relais toutes les 10 min (si Railway tombe)
+
+Le workflow « Relais du secours » se relance lui-même toutes les 10 minutes (jeton fourni par
+GitHub au passage, aucune clé ajoutée, aucun service extérieur) ; le cron ne sert qu'à relancer
+la chaîne si elle casse. Si Railway tombe, l'alerte part en 25 minutes au plus. Cockpit vivant :
+le passage ne fait qu'une lecture de son signe de vie et n'envoie rien.
+
 ## Contrôles
 
 | | Contrôle | Ce qui est mesuré |

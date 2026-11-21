@@ -1,0 +1,77 @@
+name: Relais du secours (toutes les 10 min)
+
+# Fait passer le secours toutes les 10 minutes SANS service extérieur ni clé ajoutée : chaque
+# passage relance le suivant (workflow_dispatch avec le jeton que GitHub fournit au passage).
+# Si la chaîne casse, le cron ci-dessous la relance quand GitHub le déclenche.
+# But : si Railway (donc le cockpit et sa surveillance) tombe, l'alerte part en 25 min au plus
+# (15 min sans signe de vie du cockpit + 10 min entre deux passages). Dépôt public : coût nul.
+# Cockpit vivant : le passage ne contrôle rien d'autre et n'envoie aucun message.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,37 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  relais:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Même groupe que watchdog.yml : un seul passage à la fois sur l'état anti-spam partagé.
+    concurrency:
+      group: watchdog
+      cancel-in-progress: false
+    steps:
+      - name: Chaîne déjà vivante ? (lancement par le cron seulement)
+        id: chaine
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          recent=$(gh run list -R "$GITHUB_REPOSITORY" --workflow relais.yml --event workflow_dispatch --limit 1 --json createdAt --jq '.[0].createdAt // ""')
+          if [ -n "$recent" ] && [ $(( $(date +%s) - $(date -d "$recent" +%s) )) -lt 1500 ]; then
+            echo "vivante=oui" >> "$GITHUB_OUTPUT"
+            echo "Chaîne vivante : ce lancement du cron s'arrête là."
+          fi
+
+      - name: Récupérer le script
+        if: steps.chaine.outputs.vivante != 'oui'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Relire l'état précédent (anti-spam)
+        if: steps.chaine.outputs.vivante != 'oui'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .watchdog-state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watchdog-state-
+
+      - name: Secours (cockpit vivant ? sinon contrôles A à D)
+        if: steps.chaine.outputs.vivante != 'oui'
+        run: node watchdog.mjs
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PRINCIPAL_HEALTH_URL: ${{ secrets.PRINCIPAL_HEALTH_URL }}
+          WATCHDOG_TEST: 'false'
+          WATCHDOG_STATE_FILE: .watchdog-state/state.json
+
+      - name: Mémoriser l'état
+        if: always() && steps.chaine.outputs.vivante != 'oui'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .watchdog-state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Attendre 10 min, puis relancer le passage suivant
+        if: always() && steps.chaine.outputs.vivante != 'oui'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 540
+          gh workflow run relais.yml -R "$GITHUB_REPOSITORY" --ref main
