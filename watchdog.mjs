@@ -97,6 +97,12 @@ export const CONFIG = {
 
   // ── Contrôleur de vie externe (facultatif) ──
   heartbeatFailRuns: 3,
+
+  // ── Mode secours (21.11.2026) ──
+  // La surveillance principale tourne dans le cockpit (Railway), toutes les 5 min, et publie son
+  // signe de vie sur sa route publique /health. Ce workflow GitHub n'est plus que le SECOURS : quand
+  // il passe, il lit ce signe de vie ; plus vieux que ce délai (ou absent) → alerte + contrôles.
+  principalStaleMs: 15 * MIN,
 };
 
 const TITLES = {
@@ -106,6 +112,7 @@ const TITLES = {
   disque: 'Disque de la base',
   disque_lecture: 'Lecture du niveau du disque',
   relais: 'Contrôleur de vie du watchdog',
+  principal: 'Surveillance principale (cockpit)',
 };
 
 const ACTIONS = {
@@ -115,6 +122,7 @@ const ACTIONS = {
   disque: 'libérer de la place dans la base (rétention des archives de scraping) ou agrandir le disque avant la restriction.',
   disque_lecture: 'vérifier /api/health (champs disk_level, disk_pct) et le dernier déploiement du site.',
   relais: 'vérifier le compte du contrôleur de vie ; le watchdog, lui, continue de surveiller.',
+  principal: 'Railway → service admin-backend : vérifier le dernier déploiement et ses journaux ; en attendant, ce secours fait les contrôles quand il passe.',
 };
 
 const ICON = { urgent: '🔴', important: '🟠' };
@@ -388,6 +396,21 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
   const unmeasured = new Set();
   const baseOpen = Boolean(state.incidents.base);
 
+  // Mode secours : la surveillance principale (cockpit) ne donne plus signe de vie.
+  const p = by.P;
+  if (p && p.status !== 'ok') {
+    out.push({
+      key: 'principal', level: 'urgent', panne: false, rank: 3,
+      what: `La surveillance principale (cockpit) ne tourne plus : ${p.value}.`,
+      gravity: 'plus aucun contrôle toutes les 5 min ; ce secours GitHub ne passe que de temps en temps.',
+    });
+  }
+  if (!a) {
+    // Mode secours, cockpit vivant : les contrôles du site sont faits par le cockpit, pas ici.
+    for (const k of ['base', 'site', 'fraicheur', 'disque', 'disque_lecture']) unmeasured.add(k);
+    return { incidents: out, unmeasured };
+  }
+
   if (a.status === 'crit') {
     // Une seule cause : la page vide est un symptôme de la base injoignable.
     const page = b.status !== 'ok' ? ` ; page publique : ${b.value}` : '';
@@ -562,8 +585,12 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
   const msgs = [];
   const by = Object.fromEntries(results.map((r) => [r.id, r]));
 
+  // En mode secours, ni messages d'arrêt (ce workflow passe rarement, c'est attendu) ni résumé du
+  // lundi : la surveillance principale du cockpit s'en charge.
+  const secours = Boolean(env.PRINCIPAL_HEALTH_URL);
+
   // 1) Preuve de vie : le watchdog s'est-il arrêté ? (une alerte non partie est gardée et renvoyée)
-  if (s.lastRunAt !== null) {
+  if (!secours && s.lastRunAt !== null) {
     const gap = nowMs - s.lastRunAt;
     if (gap > cfg.gapImportantMs && !s.pendingGap) s.pendingGap = { from: s.lastRunAt, to: nowMs };
     else if (gap > cfg.gapInfoMs) s.period.gaps.push(gap); // information : résumé du lundi seulement
@@ -679,7 +706,8 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
 
   // 5) Résumé hebdomadaire silencieux (lundi à partir de 08:00 heure suisse).
   const wk = weekKey(nowMs, cfg);
-  if (s.lastWeeklyKey !== wk) {
+  if (secours) s.lastWeeklyKey = wk;
+  else if (s.lastWeeklyKey !== wk) {
     msgs.push({
       text: weeklyText(s, nowMs, env, cfg), sound: false, panne: false, key: 'weekly',
       commit: (st) => {
@@ -788,8 +816,53 @@ export async function runChecks({ fetchImpl, sleep, cfg = CONFIG }) {
  * Un passage complet. Rend { exitCode, results, sent: [{ text, silent }], stateToWrite }.
  * Chaque message n'avance l'état que s'il est parti ; au premier échec, on s'arrête (job en échec).
  */
+/** Mode secours : lit le signe de vie publié par la surveillance principale (route publique /health du cockpit). */
+export async function checkPrincipal({ fetchImpl, env, nowMs, cfg = CONFIG }) {
+  try {
+    const res = await fetchWithTimeout(fetchImpl, env.PRINCIPAL_HEALTH_URL, { headers: { 'cache-control': 'no-cache' } });
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {
+      body = null;
+    }
+    const s = body && body.surveillance_site;
+    if (res.status !== 200) return { id: 'P', status: 'crit', value: `cockpit : HTTP ${res.status}` };
+    if (!s) return { id: 'P', status: 'crit', value: 'cockpit joignable, mais sans signe de vie de la surveillance' };
+    if (!s.actif) return { id: 'P', status: 'crit', value: 'surveillance désactivée dans le cockpit' };
+    const t = Date.parse(s.dernier_passage);
+    if (!Number.isFinite(t)) return { id: 'P', status: 'crit', value: 'aucun passage récent' };
+    const age = nowMs - t;
+    if (age > cfg.principalStaleMs) return { id: 'P', status: 'crit', value: `dernier passage il y a ${fmtDuration(age)} (${fmtUtc(t)})` };
+    return { id: 'P', status: 'ok', value: `dernier passage ${fmtUtc(t)}` };
+  } catch (e) {
+    return { id: 'P', status: 'crit', value: `cockpit injoignable (${errText(e)})` };
+  }
+}
+
+const CLES_DU_SITE = ['base', 'site', 'fraicheur', 'disque', 'disque_lecture'];
+
 export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, nowMs = Date.now(), log = console.log, cfg = CONFIG }) {
-  const results = await runChecks({ fetchImpl, sleep, cfg });
+  let results;
+  if (env.PRINCIPAL_HEALTH_URL) {
+    const p = await checkPrincipal({ fetchImpl, env, nowMs, cfg });
+    if (p.status === 'ok') {
+      // Cockpit vivant : il fait les contrôles du site. Le secours se tait et lui passe la main
+      // (ses propres incidents du site sont oubliés sans message : le cockpit a les siens).
+      results = [p];
+      if (prevState && prevState.version === 2) {
+        prevState = structuredClone(prevState);
+        for (const k of CLES_DU_SITE) {
+          if (prevState.incidents) delete prevState.incidents[k];
+          if (prevState.pending) delete prevState.pending[k];
+        }
+      }
+    } else {
+      results = [p, ...(await runChecks({ fetchImpl, sleep, cfg }))];
+    }
+  } else {
+    results = await runChecks({ fetchImpl, sleep, cfg });
+  }
   for (const r of results) log(`[${r.id}] ${r.status.toUpperCase()} — ${r.value}`);
 
   const { state, messages } = planRun(prevState, results, nowMs, env, cfg);
