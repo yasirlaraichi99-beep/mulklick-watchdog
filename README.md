@@ -26,6 +26,10 @@ GitHub au passage, aucune clé ajoutée, aucun service extérieur) ; le cron ne 
 la chaîne si elle casse. Si Railway tombe, l'alerte part en 25 minutes au plus. Cockpit vivant :
 le passage ne fait qu'une lecture de son signe de vie et n'envoie rien.
 
+Chaque passage se signale au cockpit (`/health?secours=1`) : si le secours ne passe plus depuis
+40 minutes, le cockpit prévient Yasir (une fois, en silencieux). Les deux se surveillent l'un l'autre.
+Les passages automatiques ne passent plus par watchdog.yml (lancement manuel et garde-vie seulement).
+
 ## Contrôles
 
 | | Contrôle | Ce qui est mesuré |
