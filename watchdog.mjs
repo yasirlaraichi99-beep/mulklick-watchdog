@@ -817,9 +817,21 @@ export async function runChecks({ fetchImpl, sleep, cfg = CONFIG }) {
  * Chaque message n'avance l'état que s'il est parti ; au premier échec, on s'arrête (job en échec).
  */
 /** Mode secours : lit le signe de vie publié par la surveillance principale (route publique /health du cockpit). */
+// Chaque passage du secours se signale au cockpit (?secours=1) : le cockpit sait ainsi que le
+// secours tourne, et prévient Yasir s'il ne passe plus. Lecture seule, rien d'autre.
+export function urlSecours(base) {
+  try {
+    const u = new URL(base);
+    u.searchParams.set('secours', '1');
+    return u.toString();
+  } catch {
+    return base;
+  }
+}
+
 export async function checkPrincipal({ fetchImpl, env, nowMs, cfg = CONFIG }) {
   try {
-    const res = await fetchWithTimeout(fetchImpl, env.PRINCIPAL_HEALTH_URL, { headers: { 'cache-control': 'no-cache' } });
+    const res = await fetchWithTimeout(fetchImpl, urlSecours(env.PRINCIPAL_HEALTH_URL), { headers: { 'cache-control': 'no-cache' } });
     let body = null;
     try {
       body = await res.json();

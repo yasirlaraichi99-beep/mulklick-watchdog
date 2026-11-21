@@ -67,6 +67,7 @@ function fakeNet(site) {
     }
     if (u.hostname === 'cockpit.example' && u.pathname === '/health') {
       calls.principal = (calls.principal ?? 0) + 1;
+      calls.principalSecours = u.searchParams.get('secours');
       if (site.principalThrows) throw Object.assign(new Error('x'), { name: 'TypeError' });
       return jsonRes(site.principalStatus ?? 200, site.principal ?? { status: 'ok' });
     }
@@ -563,6 +564,14 @@ test('SECOURS — cockpit vivant : aucun contrôle du site, aucun message', asyn
   assert.equal(r.calls.page, 0);
   assert.equal(r.calls.telegram.length, 0);
   assert.equal(r.byId.P.status, 'ok');
+});
+
+test('SECOURS — chaque passage se signale au cockpit (?secours=1)', async () => {
+  const r = await run({ principal: vivant(T0 - 3 * MIN) }, { env: SECOURS_ENV });
+  assert.equal(r.calls.principalSecours, '1');
+  const { urlSecours } = await import('./watchdog.mjs');
+  assert.equal(urlSecours('https://c.example/health?x=2'), 'https://c.example/health?x=2&secours=1');
+  assert.equal(urlSecours('pas une url'), 'pas une url');
 });
 
 test('SECOURS — cockpit muet depuis 40 min : alerte URGENTE sonore + le secours fait les contrôles', async () => {

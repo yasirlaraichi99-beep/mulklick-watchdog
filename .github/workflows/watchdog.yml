@@ -7,13 +7,12 @@ name: Watchdog Mulklick
 # par les secrets du dépôt (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID). Les journaux des runs sont publics : le script n'y écrit que des statuts.
 # Aucun déclencheur pull_request : un fork ne peut rien lancer ici.
 #
-# Déclencheur principal : cron-job.org appelle workflow_dispatch toutes les 10 minutes (le cron
-# GitHub ci-dessous ne se déclenche pas, problème GitHub connu depuis fin octobre 2026). Le cron
-# reste en place : s'il revient, il double les passages sans doubler les alertes.
+# Depuis le 21.11.2026 : les passages automatiques (toutes les 10 min) sont faits par relais.yml.
+# Ce workflow ne sert plus qu'au lancement manuel (test) et au garde-vie mensuel du dépôt.
+# Un lancement manuel partage le groupe de concurrence du relais : à éviter sans raison.
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
     # Garde-vie : GitHub désactive le cron d'un dépôt public après 60 jours sans activité.
     - cron: '17 6 1 * *'
   workflow_dispatch:
@@ -28,7 +27,7 @@ permissions:
 
 jobs:
   watchdog:
-    if: github.event.schedule != '17 6 1 * *'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Un seul passage à la fois : deux runs simultanés se disputeraient l'état anti-spam.
