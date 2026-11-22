@@ -31,7 +31,7 @@ le passage ne fait qu'une lecture de son signe de vie et n'envoie rien.
 | | Contrôle | Ce qui est mesuré |
 |---|---|---|
 | A | `GET /api/health` du site | statut 200 et `db_ok` vrai, 3 essais espacés de 20 s |
-| B | `GET /fr/intelligence` (anti-cache) | cartes nationales avec donnée. Deux formats : `data-card-state="value"`/`"reserved"` (donnée en clair ou masquée aux visiteurs non connectés) contre `"empty"` (aucune donnée) ; à défaut, ancien comptage `data-spark=""` / « Aucune valeur actuelle ». Le watchdog reste anonyme (aucune session ni clé) |
+| B | `GET /fr/intelligence` (anti-cache) | les 8 cartes nationales affichent une valeur (`data-card-state="value"`). Site ouvert depuis le 21.11.2026 : une carte `"reserved"` (masquée aux visiteurs), `"empty"` (aucune donnée) ou manquante donne un avertissement ; aucune carte en clair et des cartes vides, une alerte urgente. À défaut, ancien comptage `data-spark=""` / « Aucune valeur actuelle ». Le watchdog reste anonyme (aucune session ni clé) |
 | C | fraîcheur (`age_hours` de /api/health) | ≤ 120 h (scraper lun/mar/jeu/ven, écart max ven → lun 3 j, + 2 j) |
 | D | disque (`disk_level`, `disk_pct` de /api/health, aucune clé) | seuils 65 / 80 / 90 % de 18 GB + projection du remplissage |
 
