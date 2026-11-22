@@ -30,6 +30,32 @@ Chaque passage se signale au cockpit (`/health?secours=1`) : si le secours ne pa
 40 minutes, le cockpit prévient Yasir (une fois, en silencieux). Les deux se surveillent l'un l'autre.
 Les passages automatiques ne passent plus par watchdog.yml (lancement manuel et garde-vie seulement).
 
+## Boîte d'alertes du cockpit (22.11.2026)
+
+Le propriétaire reçoit ce bot (« Mulklick Alertes »), pas celui du cockpit. Le cockpit dépose donc
+chacun de ses messages dans une boîte en mémoire (`GET /health/boite`, `POST /health/boite/acquitter`)
+que le relais relève à chaque passage :
+
+- **Authentification** : jeton OIDC de GitHub Actions (audience `mulklick-cockpit-boite`), vérifié
+  par le cockpit avec les clés publiques de GitHub. Aucun secret partagé, rien à copier. Le job
+  `relais` de `relais.yml` a pour cela la permission `id-token: write` ; `watchdog.yml` (lancement
+  manuel) ne l'a pas : sans jeton, un lancement manuel ne relève rien (mode historique).
+- **Cockpit vivant et boîte lisible** : les messages sont livrés par ce bot, le plus ancien d'abord,
+  avec son seulement si le cockpit le demande, 5 au plus par passage (le reste attend le passage
+  suivant), puis acquittés. Au premier échec d'envoi, arrêt : seuls les messages partis sont acquittés.
+- **Boîte non lisible** (404 = pas encore déployée, 401, 5xx, réseau, réponse illisible) : le relais
+  fait lui-même les contrôles A à D, comme si le cockpit était mort. Fusionner ce dépôt seul protège
+  donc déjà mulklick.ch. Hors 404, un incident 🟠 silencieux « boîte » est ouvert (une fois, après
+  2 passages de suite).
+- **Diagnostics du `/health` public** : 🟠 silencieux « envoi direct du cockpit » quand son dernier
+  échec Telegram est plus récent que son dernier succès (le texte reprend l'erreur donnée par
+  Telegram ; ses alertes arrivent quand même ici) ; clos 1 h après un succès postérieur. Si le plus
+  ancien message de la boîte attend depuis plus de 30 min sans avoir été relevé, incident « boîte ».
+- **Journaux publics** : seulement des statuts et compteurs (`Boîte : 2 relevé(s), 2 livré(s), 2
+  acquitté(s)`), jamais un texte d'alerte, un jeton ni un corps de réponse.
+- **Limite connue** : si le relais lui-même s'arrête, la boîte n'est plus relevée ; l'alerte
+  « secours absent » du cockpit ne part alors que par son bot direct.
+
 ## Contrôles
 
 | | Contrôle | Ce qui est mesuré |
