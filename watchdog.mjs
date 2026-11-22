@@ -103,6 +103,17 @@ export const CONFIG = {
   // signe de vie sur sa route publique /health. Ce workflow GitHub n'est plus que le SECOURS : quand
   // il passe, il lit ce signe de vie ; plus vieux que ce délai (ou absent) → alerte + contrôles.
   principalStaleMs: 15 * MIN,
+
+  // ── Boîte d'alertes du cockpit (22.11.2026) ──
+  // Le propriétaire reçoit ce bot (« Mulklick Alertes »), pas celui du cockpit. Le cockpit dépose donc
+  // ses messages dans une boîte que ce relais relève (jeton OIDC de GitHub Actions, aucun secret
+  // partagé), livre par ce bot, puis acquitte. Si la boîte n'est pas relevable, le relais fait lui-même
+  // les contrôles du site (comme si le cockpit était mort).
+  boiteAudience: 'mulklick-cockpit-boite',
+  boitePath: '/health/boite',
+  boiteAcquitterPath: '/health/boite/acquitter',
+  boiteMaxParPassage: 5, // un afflux ne sonne pas en rafale : le reste attend le passage suivant
+  boiteAncienneteMs: 30 * MIN, // message plus ancien que ça dans la boîte du cockpit : elle n'est pas relevée
 };
 
 const TITLES = {
@@ -113,6 +124,8 @@ const TITLES = {
   disque_lecture: 'Lecture du niveau du disque',
   relais: 'Contrôleur de vie du watchdog',
   principal: 'Surveillance principale (cockpit)',
+  telegram_cockpit: 'Envoi Telegram direct du cockpit',
+  boite: 'Boîte d’alertes du cockpit',
 };
 
 const ACTIONS = {
@@ -123,6 +136,8 @@ const ACTIONS = {
   disque_lecture: 'vérifier /api/health (champs disk_level, disk_pct) et le dernier déploiement du site.',
   relais: 'vérifier le compte du contrôleur de vie ; le watchdog, lui, continue de surveiller.',
   principal: 'Railway → service admin-backend : vérifier le dernier déploiement et ses journaux ; en attendant, ce secours fait les contrôles quand il passe.',
+  telegram_cockpit: 'revoir le bot Telegram du cockpit (variables Railway) quand tu as un moment ; rien d’urgent.',
+  boite: 'onglet Actions de mulklick-watchdog (étape « Secours ») et déploiement du cockpit sur Railway.',
 };
 
 const ICON = { urgent: '🔴', important: '🟠' };
@@ -403,6 +418,28 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
       key: 'principal', level: 'urgent', panne: false, rank: 3,
       what: `La surveillance principale (cockpit) ne tourne plus : ${p.value}.`,
       gravity: 'plus aucun contrôle toutes les 5 min ; ce secours GitHub ne passe que de temps en temps.',
+    });
+  }
+  // Cockpit vivant seulement : son envoi direct et sa boîte d'alertes. Cockpit mort : on ne sait rien
+  // d'eux, leurs incidents restent tels quels (le message « cockpit arrêté » suffit, pas de doublon).
+  const t = by.T;
+  if (!p || p.status !== 'ok' || !t || t.status === 'skip') unmeasured.add('telegram_cockpit');
+  else if (t.status === 'warn') {
+    out.push({
+      key: 'telegram_cockpit', level: 'important', panne: false, rank: 1,
+      what: `Le bot du cockpit n’arrive plus à envoyer depuis ${t.since}${t.detail ? ` (${t.detail})` : ''}.`,
+      gravity: 'ses alertes te parviennent quand même ici, par le relais.',
+    });
+  }
+  const k = by.K;
+  if (!p || p.status !== 'ok' || !k || k.status === 'skip') unmeasured.add('boite');
+  else if (k.status === 'crit') {
+    out.push({
+      key: 'boite', level: 'important', panne: false, rank: 1, confirm: true,
+      what: `Les alertes du cockpit ne te parviennent plus (${k.value}).`,
+      gravity: k.fallback
+        ? 'en attendant, le relais refait lui-même les contrôles du site.'
+        : 'le relais ne les relève pas ; les contrôles du site restent faits par le cockpit.',
     });
   }
   if (!a) {
@@ -846,27 +883,171 @@ export async function checkPrincipal({ fetchImpl, env, nowMs, cfg = CONFIG }) {
     if (!Number.isFinite(t)) return { id: 'P', status: 'crit', value: 'aucun passage récent' };
     const age = nowMs - t;
     if (age > cfg.principalStaleMs) return { id: 'P', status: 'crit', value: `dernier passage il y a ${fmtDuration(age)} (${fmtUtc(t)})` };
-    return { id: 'P', status: 'ok', value: `dernier passage ${fmtUtc(t)}` };
+    return { id: 'P', status: 'ok', value: `dernier passage ${fmtUtc(t)}`, health: body };
   } catch (e) {
     return { id: 'P', status: 'crit', value: `cockpit injoignable (${errText(e)})` };
   }
+}
+
+// ───────────────────────────── boîte d'alertes du cockpit ─────────────────────────────
+
+/** Envoi direct du cockpit en échec ? Le détail (description Telegram) ne va que dans le message, jamais dans `value` (journal public). */
+export function checkTelegramCockpit(principal) {
+  const d = principal?.health?.telegram?.direct;
+  if (!d || typeof d !== 'object') return { id: 'T', status: 'skip', value: 'envoi direct du cockpit : non publié' };
+  const echec = Date.parse(d.dernier_echec);
+  const ok = Date.parse(d.dernier_ok);
+  if (!Number.isFinite(echec) || (Number.isFinite(ok) && ok >= echec)) {
+    return { id: 'T', status: 'ok', value: 'envoi direct du cockpit : sans échec en cours' };
+  }
+  const detail = typeof d.dernier_echec_detail === 'string'
+    ? d.dernier_echec_detail.replace(/bot\d+:[\w-]+/g, '').replace(/\s+/g, ' ').trim().slice(0, 160)
+    : '';
+  return {
+    id: 'T', status: 'warn', value: 'envoi direct du cockpit : échec en cours',
+    since: new Date(echec).toISOString().slice(11, 16) + ' UTC', detail,
+  };
+}
+
+const boiteErreur = (value) => ({ id: 'K', status: 'crit', value, kind: 'erreur', delivered: 0, failed: false });
+
+/**
+ * Relève la boîte du cockpit : jeton OIDC → GET → livraison par ce bot → acquittement.
+ * Rend { id: 'K', status, kind: 'lu' | 'absent' | 'erreur' | 'skip', value, delivered, failed }.
+ * Ne journalise jamais un texte d'alerte, un jeton, un corps de réponse ni un identifiant.
+ */
+export async function releverBoite({ fetchImpl, env, log = console.log, cfg = CONFIG }) {
+  const tokenUrl = env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const tokenAuth = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!env.PRINCIPAL_HEALTH_URL || !tokenUrl || !tokenAuth) {
+    return { id: 'K', status: 'skip', kind: 'skip', value: 'pas de jeton OIDC ou de cockpit : boîte non relevée', delivered: 0, failed: false };
+  }
+  let origin;
+  let reqUrl;
+  try {
+    origin = new URL(env.PRINCIPAL_HEALTH_URL).origin;
+    reqUrl = new URL(tokenUrl);
+    reqUrl.searchParams.set('audience', cfg.boiteAudience);
+  } catch {
+    return boiteErreur('adresse illisible');
+  }
+  const jsonOf = async (res) => {
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
+  };
+
+  // 1) Jeton OIDC (signé par GitHub, de courte durée, jamais journalisé).
+  let jwt;
+  try {
+    const res = await fetchWithTimeout(fetchImpl, reqUrl.toString(), { headers: { Authorization: `bearer ${tokenAuth}` } });
+    const body = res.status === 200 ? await jsonOf(res) : null;
+    if (!body || typeof body.value !== 'string' || !body.value) return boiteErreur(`jeton OIDC non fourni (HTTP ${res.status})`);
+    jwt = body.value;
+  } catch (e) {
+    return boiteErreur(`jeton OIDC non fourni (${errText(e)})`);
+  }
+  const headers = { Authorization: `Bearer ${jwt}` };
+
+  // 2) Relève.
+  let data;
+  try {
+    const res = await fetchWithTimeout(fetchImpl, `${origin}${cfg.boitePath}`, { headers: { ...headers, 'cache-control': 'no-cache' } });
+    if (res.status === 404) {
+      return { id: 'K', status: 'ok', kind: 'absent', value: 'boîte absente du cockpit (HTTP 404) : fonction pas encore déployée', delivered: 0, failed: false };
+    }
+    if (res.status !== 200) return boiteErreur(`relève refusée ou en erreur (HTTP ${res.status})`);
+    data = await jsonOf(res);
+  } catch (e) {
+    return boiteErreur(`cockpit injoignable (${errText(e)})`);
+  }
+  if (!data || typeof data.boot !== 'string' || !Array.isArray(data.messages)) return boiteErreur('réponse de la boîte illisible');
+
+  // 3) Livraison : plus ancien d'abord, son selon `sonner`, au plus N par passage, arrêt au premier échec.
+  const valides = data.messages
+    .filter((m) => m && Number.isInteger(m.id) && typeof m.texte === 'string' && m.texte.length > 0)
+    .sort((x, y) => x.id - y.id)
+    .slice(0, cfg.boiteMaxParPassage);
+  const livres = [];
+  let failed = false;
+  for (const m of valides) {
+    try {
+      await sendTelegram({ fetchImpl, token: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID, text: m.texte, silent: m.sonner !== true });
+    } catch (e) {
+      log(`ÉCHEC de l'envoi Telegram (boîte) : ${e.message}`);
+      failed = true;
+      break;
+    }
+    livres.push(m.id);
+  }
+
+  // 4) Acquittement des seuls messages partis.
+  let acquittes = 0;
+  let ackOk = true;
+  if (livres.length) {
+    try {
+      const res = await fetchWithTimeout(fetchImpl, `${origin}${cfg.boiteAcquitterPath}`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ boot: data.boot, ids: livres }),
+      });
+      if (res.status === 200) {
+        const b = await jsonOf(res);
+        acquittes = b && Number.isInteger(b.acquittes) ? b.acquittes : livres.length;
+      } else {
+        ackOk = false;
+      }
+    } catch {
+      ackOk = false;
+    }
+  }
+  log(`Boîte : ${data.messages.length} relevé(s), ${livres.length} livré(s), ${acquittes} acquitté(s)${ackOk ? '' : ' (acquittement refusé)'}`);
+  if (!ackOk) return { ...boiteErreur('acquittement refusé : les messages seront relivrés'), delivered: livres.length, failed };
+  return { id: 'K', status: 'ok', kind: 'lu', value: `${data.messages.length} relevé(s), ${livres.length} livré(s), ${acquittes} acquitté(s)`, delivered: livres.length, failed };
+}
+
+/** Boîte non relevée ce passage, alors que /health dit que son plus ancien message attend depuis trop longtemps. */
+export function checkAncienneteBoite(box, principal, nowMs, cfg = CONFIG) {
+  if (box.kind === 'lu' || box.kind === 'erreur' || box.kind === 'absent') return box;
+  const t = Date.parse(principal?.health?.telegram?.boite?.plus_ancien);
+  if (Number.isFinite(t) && nowMs - t > cfg.boiteAncienneteMs) {
+    return { ...box, status: 'crit', kind: 'ancien', value: `un message attend dans la boîte depuis plus de ${Math.round(cfg.boiteAncienneteMs / MIN)} min` };
+  }
+  return box;
 }
 
 const CLES_DU_SITE = ['base', 'site', 'fraicheur', 'disque', 'disque_lecture'];
 
 export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, nowMs = Date.now(), log = console.log, cfg = CONFIG }) {
   let results;
+  let failed = false;
+  let boiteLivres = 0;
   if (env.PRINCIPAL_HEALTH_URL) {
     const p = await checkPrincipal({ fetchImpl, env, nowMs, cfg });
     if (p.status === 'ok') {
-      // Cockpit vivant : il fait les contrôles du site. Le secours se tait et lui passe la main
-      // (ses propres incidents du site sont oubliés sans message : le cockpit a les siens).
-      results = [p];
-      if (prevState && prevState.version === 2) {
+      // Cockpit vivant : relever sa boîte d'alertes (livraison par ce bot), puis lire ses diagnostics.
+      const box = await releverBoite({ fetchImpl, env, log, cfg });
+      boiteLivres = box.delivered;
+      if (box.failed) failed = true;
+      const k = checkAncienneteBoite(box, p, nowMs, cfg);
+      // Boîte non relevable (404, 401, 5xx, réseau, JSON) : le relais refait LUI-MÊME les contrôles A à D.
+      // Dans GitHub Actions sans jeton OIDC (permission id-token absente, lancement manuel par
+      // watchdog.yml) : la boîte ne peut pas être relevée, donc repli aussi — jamais le silence.
+      const sansJetonSurGitHub = box.kind === 'skip' && String(env.GITHUB_ACTIONS).toLowerCase() === 'true';
+      const repli = box.kind === 'erreur' || box.kind === 'absent' || sansJetonSurGitHub;
+      if (k.status === 'crit') k.fallback = repli;
+      results = [p, checkTelegramCockpit(p), k];
+      if (repli) {
+        results.push(...(await runChecks({ fetchImpl, sleep, cfg })));
+      } else if (prevState && prevState.version === 2) {
+        // Le cockpit fait les contrôles du site. Le secours se tait et lui passe la main
+        // (ses propres incidents du site sont oubliés sans message : le cockpit a les siens).
         prevState = structuredClone(prevState);
-        for (const k of CLES_DU_SITE) {
-          if (prevState.incidents) delete prevState.incidents[k];
-          if (prevState.pending) delete prevState.pending[k];
+        for (const key of CLES_DU_SITE) {
+          if (prevState.incidents) delete prevState.incidents[key];
+          if (prevState.pending) delete prevState.pending[key];
         }
       }
     } else {
@@ -883,7 +1064,6 @@ export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, no
   }
 
   const sent = [];
-  let failed = false;
   for (const m of messages) {
     try {
       await sendTelegram({ fetchImpl, token: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID, text: m.text, silent: !m.sound });
@@ -902,7 +1082,7 @@ export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, no
     state.heartbeatFails = ok ? 0 : (state.heartbeatFails ?? 0) + 1;
     log(`Contrôleur de vie : ${ok ? 'signal reçu' : 'signal refusé'}.`);
   }
-  return { exitCode: failed ? 1 : 0, results, sent, stateToWrite: state };
+  return { exitCode: failed ? 1 : 0, results, sent, boiteLivres, stateToWrite: state };
 }
 
 async function readState(file) {

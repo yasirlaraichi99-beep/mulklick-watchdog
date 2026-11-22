@@ -4,8 +4,9 @@ name: Relais du secours (toutes les 10 min)
 # chaque passage relance le suivant (workflow_dispatch avec le jeton fourni par GitHub au passage).
 # But : si Railway (donc le cockpit et sa surveillance) tombe, l'alerte part en 25 min au plus
 # (15 min sans signe de vie du cockpit + 10 min entre deux passages). Dépôt public : coût nul.
-# Cockpit vivant : le passage ne fait que lire son signe de vie (et s'y signale par ?secours=1)
-# et n'envoie aucun message. Le cockpit, lui, prévient Yasir si le secours ne passe plus.
+# Cockpit vivant : le passage lit son signe de vie (et s'y signale par ?secours=1), relève sa boîte
+# d'alertes (jeton OIDC GitHub) et livre ses messages par « Mulklick Alertes » ; si la boîte n'est
+# pas relevable, il refait lui-même les contrôles du site. Le cockpit, lui, prévient Yasir si le secours ne passe plus.
 #
 # Robustesse de la chaîne :
 # - le cron ne sert qu'à la relancer si elle a cassé ; son contrôle tourne HORS du groupe de
@@ -50,6 +51,12 @@ jobs:
     if: needs.chaine.outputs.vivante != 'oui'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # id-token: write = le passage peut demander à GitHub un jeton OIDC (audience du cockpit) pour
+    # relever la boîte d'alertes du cockpit ; aucun secret partagé. actions: write = relancer la chaîne.
+    permissions:
+      contents: read
+      actions: write
+      id-token: write
     # Même groupe que watchdog.yml : un seul passage à la fois sur l'état anti-spam partagé.
     concurrency:
       group: watchdog
@@ -67,7 +74,9 @@ jobs:
           key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: watchdog-state-
 
-      - name: Secours (cockpit vivant ? sinon contrôles A à D)
+      # ACTIONS_ID_TOKEN_REQUEST_URL et ACTIONS_ID_TOKEN_REQUEST_TOKEN sont fournis par le runner à
+      # chaque étape (grâce à id-token: write) ; le script les lit, ne les affiche jamais.
+      - name: Secours (cockpit vivant ? boîte d'alertes relevée ; sinon contrôles A à D)
         run: node watchdog.mjs
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

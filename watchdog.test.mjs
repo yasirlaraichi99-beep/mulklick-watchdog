@@ -618,3 +618,251 @@ test('SECOURS — ni résumé du lundi ni message « n’a pas tourné » (le se
   const r2 = await run({ principal: vivant(lundi - MIN) }, { env: SECOURS_ENV, prevState: r1.state, nowMs: lundi });
   assert.equal(r2.calls.telegram.length, 0);
 });
+
+// ───────────────────────────── boîte d'alertes du cockpit (relève OIDC) ─────────────────────────────
+
+const OIDC_ENV = {
+  ...SECOURS_ENV,
+  ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example/token?api-version=2.0',
+  ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'REQUEST-TOKEN-SECRET',
+};
+const JWT = 'JWT.SECRET.VALUE';
+const bx = (id, texte, sonner = false) => ({ id, cree_le: '2026-11-22T18:05:00Z', sonner, texte });
+const boiteOk = (messages) => ({ status: 200, body: { boot: 'a1b2c3d4', en_attente: messages.length, messages } });
+
+/** Faux réseau avec jeton OIDC et boîte du cockpit. `o` : { boite, ack, tokenStatus, site }. */
+async function runBoite(o = {}, { env = OIDC_ENV, prevState = null, nowMs = T0 } = {}) {
+  const base = fakeNet({ principal: vivant(nowMs - MIN), ...(o.site ?? {}) });
+  const seen = { tokenUrl: null, tokenAuth: null, boiteAuth: null, acks: [], order: [] };
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(url);
+    if (u.hostname === 'oidc.example') {
+      seen.tokenUrl = url;
+      seen.tokenAuth = init.headers?.Authorization;
+      if (o.tokenStatus && o.tokenStatus !== 200) return jsonRes(o.tokenStatus, {});
+      return jsonRes(200, { value: JWT });
+    }
+    if (u.hostname === 'cockpit.example' && u.pathname === '/health/boite') {
+      seen.boiteAuth = init.headers?.Authorization;
+      seen.order.push('releve');
+      const b = o.boite ?? boiteOk([]);
+      if (b.throws) throw Object.assign(new Error('x'), { name: 'TypeError' });
+      if (b.badJson) return { status: b.status ?? 200, json: async () => { throw new Error('bad'); } };
+      return jsonRes(b.status, b.body ?? {});
+    }
+    if (u.hostname === 'cockpit.example' && u.pathname === '/health/boite/acquitter') {
+      assert.equal(init.method, 'POST');
+      assert.equal(init.headers.Authorization, `Bearer ${JWT}`);
+      const body = JSON.parse(init.body);
+      seen.acks.push(body);
+      seen.order.push('ack');
+      return jsonRes(o.ack?.status ?? 200, { acquittes: body.ids.length });
+    }
+    return base.fetchImpl(url, init);
+  };
+  const logs = [];
+  const out = await runOnce({
+    fetchImpl, sleep: async () => {}, env: { ...BASE_ENV, ...env },
+    prevState: prevState === null ? null : JSON.parse(JSON.stringify(prevState)), nowMs, log: (l) => logs.push(l),
+  });
+  return { ...out, state: JSON.parse(JSON.stringify(out.stateToWrite)), calls: base.calls, seen, logs };
+}
+
+test('BOÎTE — jeton OIDC demandé avec l’audience, livraison du plus ancien au plus récent, son selon `sonner`, puis acquittement', async () => {
+  const r = await runBoite({ boite: boiteOk([bx(8, 'deuxième', false), bx(7, 'premier', true)]) });
+  assert.match(r.seen.tokenUrl, /^https:\/\/oidc\.example\/token\?api-version=2\.0&audience=mulklick-cockpit-boite$/);
+  assert.equal(r.seen.tokenAuth, 'bearer REQUEST-TOKEN-SECRET');
+  assert.equal(r.seen.boiteAuth, `Bearer ${JWT}`);
+  assert.deepEqual(r.calls.telegram.map((m) => [m.text, m.silent]), [['premier', false], ['deuxième', true]]);
+  assert.deepEqual(r.seen.acks, [{ boot: 'a1b2c3d4', ids: [7, 8] }]);
+  assert.deepEqual(r.seen.order, ['releve', 'ack']);
+  assert.equal(r.exitCode, 0);
+  assert.ok(r.logs.includes('Boîte : 2 relevé(s), 2 livré(s), 2 acquitté(s)'));
+  assert.equal(r.calls.health + r.calls.page, 0, 'boîte relevée : aucun contrôle du site par le relais');
+});
+
+test('BOÎTE — au plus 5 messages par passage, le reste attend', async () => {
+  const msgs = [1, 2, 3, 4, 5, 6, 7].map((i) => bx(i, `m${i}`, true));
+  const r = await runBoite({ boite: boiteOk(msgs) });
+  assert.equal(r.calls.telegram.length, 5);
+  assert.deepEqual(r.seen.acks[0].ids, [1, 2, 3, 4, 5]);
+  assert.ok(r.logs.includes('Boîte : 7 relevé(s), 5 livré(s), 5 acquitté(s)'));
+});
+
+test('BOÎTE — échec d’envoi en cours de route : on s’arrête, seuls les messages partis sont acquittés, le job échoue', async () => {
+  const base = fakeNet({ principal: vivant(T0 - MIN) });
+  let sends = 0;
+  const acks = [];
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(url);
+    if (u.hostname === 'oidc.example') return jsonRes(200, { value: JWT });
+    if (u.pathname === '/health/boite') return jsonRes(200, { boot: 'b', en_attente: 3, messages: [bx(1, 'a'), bx(2, 'b'), bx(3, 'c')] });
+    if (u.pathname === '/health/boite/acquitter') { acks.push(JSON.parse(init.body)); return jsonRes(200, { acquittes: 1 }); }
+    if (u.hostname === 'api.telegram.org') {
+      sends += 1;
+      if (sends === 2) return jsonRes(500, { ok: false, description: 'Internal' });
+    }
+    return base.fetchImpl(url, init);
+  };
+  const out = await runOnce({ fetchImpl, sleep: async () => {}, env: { ...BASE_ENV, ...OIDC_ENV }, prevState: null, nowMs: T0, log: () => {} });
+  assert.equal(sends, 2, 'arrêt au premier échec');
+  assert.deepEqual(acks, [{ boot: 'b', ids: [1] }]);
+  assert.equal(out.exitCode, 1);
+});
+
+test('BOÎTE — 404 (fonction pas encore déployée) : aucun incident, les contrôles A à D sont faits par le relais', async () => {
+  const r = await runBoite({ boite: { status: 404, body: {} } });
+  assert.equal(r.calls.health, 1);
+  assert.equal(r.calls.page, 1);
+  assert.deepEqual(r.calls.telegram, []);
+  assert.equal(r.state.incidents.boite, undefined);
+  assert.equal(r.state.pending.boite, undefined);
+  // …et un site en panne est alors annoncé par ce bot, avec son.
+  const down = await runBoite({ boite: { status: 404, body: {} }, site: DOWN });
+  assert.equal(down.calls.telegram.length, 1);
+  assert.equal(down.calls.telegram[0].silent, false);
+  assert.match(down.calls.telegram[0].text, /Base de données ou \/api\/health injoignable/);
+  assert.equal(down.exitCode, 0);
+});
+
+for (const [nom, boite] of [
+  ['401', { status: 401, body: { detail: 'refuse' } }],
+  ['500', { status: 500, body: {} }],
+  ['réseau', { throws: true }],
+  ['JSON illisible', { status: 200, badJson: true }],
+  ['forme inattendue', { status: 200, body: { boot: 'x' } }],
+]) {
+  test(`BOÎTE — ${nom} : incident « boîte » (confirmé sur 2 passages, silencieux, une fois) et contrôles A à D par le relais`, async () => {
+    const r1 = await runBoite({ boite }, { nowMs: T0 });
+    assert.equal(r1.calls.health, 1, 'contrôles du site faits');
+    assert.equal(r1.calls.telegram.length, 0, 'première constatation : pas encore de message');
+    const r2 = await runBoite({ boite }, { prevState: r1.state, nowMs: T0 + 10 * MIN });
+    assert.equal(r2.calls.telegram.length, 1);
+    assert.equal(r2.calls.telegram[0].silent, true);
+    assert.match(r2.calls.telegram[0].text, /^🟠 IMPORTANT — Les alertes du cockpit ne te parviennent plus/);
+    assert.match(r2.calls.telegram[0].text, /le relais refait lui-même les contrôles du site/);
+    assert.ok(lines(r2.calls.telegram[0].text) <= 3);
+    const r3 = await runBoite({ boite }, { prevState: r2.state, nowMs: T0 + 20 * MIN });
+    assert.equal(r3.calls.telegram.length, 0, 'une seule fois');
+    // Boîte de nouveau lisible : clôture silencieuse après 1 h.
+    const ok = await runBoite({ boite: boiteOk([]) }, { prevState: r3.state, nowMs: T0 + 30 * MIN });
+    assert.equal(ok.calls.telegram.length, 0);
+    const clos = await runBoite({ boite: boiteOk([]) }, { prevState: ok.state, nowMs: T0 + 100 * MIN });
+    assert.equal(clos.calls.telegram.length, 1);
+    assert.match(clos.calls.telegram[0].text, /^🟢 RÉSOLU — Boîte d’alertes du cockpit/);
+  });
+}
+
+test('BOÎTE — jeton OIDC refusé par GitHub : même repli', async () => {
+  const r = await runBoite({ tokenStatus: 403 });
+  assert.equal(r.calls.health, 1);
+  assert.equal(r.seen.boiteAuth, null);
+  assert.ok(r.state.pending.boite);
+});
+
+test('BOÎTE — acquittement refusé : incident (les messages seraient relivrés en double), pas d’arrêt', async () => {
+  const r = await runBoite({ boite: boiteOk([bx(1, 'a')]), ack: { status: 401 } });
+  assert.equal(r.calls.telegram.length, 1);
+  assert.ok(r.state.pending.boite);
+  assert.ok(r.logs.includes('Boîte : 1 relevé(s), 1 livré(s), 0 acquitté(s) (acquittement refusé)'));
+});
+
+test('BOÎTE — cockpit arrêté : comportement historique, aucun appel à la boîte, pas de doublon « boîte »', async () => {
+  const r = await runBoite({ site: { principal: vivant(T0 - 2 * H) } });
+  assert.equal(r.seen.tokenUrl, null);
+  assert.equal(r.seen.boiteAuth, null);
+  assert.equal(r.calls.telegram.length, 1);
+  assert.match(r.calls.telegram[0].text, /surveillance principale/);
+  assert.equal(r.state.pending.boite, undefined);
+});
+
+test('BOÎTE — sans PRINCIPAL_HEALTH_URL ou sans variables OIDC : mode historique, aucune relève', async () => {
+  const sansOidc = await runBoite({}, { env: SECOURS_ENV });
+  assert.equal(sansOidc.seen.tokenUrl, null);
+  assert.equal(sansOidc.calls.health + sansOidc.calls.page, 0, 'cockpit vivant : le secours se tait');
+  assert.deepEqual(sansOidc.calls.telegram, []);
+  const sansUrl = await runBoite({}, { env: { ACTIONS_ID_TOKEN_REQUEST_URL: OIDC_ENV.ACTIONS_ID_TOKEN_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'x' } });
+  assert.equal(sansUrl.seen.tokenUrl, null);
+});
+
+test('BOÎTE — dans GitHub Actions sans jeton OIDC : pas d’incident, mais les contrôles A à D sont faits (jamais le silence)', async () => {
+  const r = await runBoite({}, { env: { ...SECOURS_ENV, GITHUB_ACTIONS: 'true' } });
+  assert.equal(r.seen.tokenUrl, null);
+  assert.equal(r.calls.health, 1);
+  assert.equal(r.calls.page, 1);
+  assert.deepEqual(r.calls.telegram, []);
+  assert.equal(r.state.incidents.boite, undefined);
+  const down = await runBoite({ site: DOWN }, { env: { ...SECOURS_ENV, GITHUB_ACTIONS: 'true' } });
+  assert.equal(down.calls.telegram.length, 1);
+  assert.equal(down.calls.telegram[0].silent, false);
+});
+
+const direct = (d, plusAncien = null, now = T0) => ({ ...vivant(now - MIN), telegram: { direct: d, boite: { active: true, en_attente: 0, plus_ancien: plusAncien } } });
+
+test('TELEGRAM COCKPIT — échec plus récent que le dernier succès : un message silencieux avec le détail, une fois, clos après un succès postérieur', async () => {
+  const echec = new Date(T0 - 40 * MIN).toISOString();
+  const d = { configure: true, dernier_ok: new Date(T0 - 3 * H).toISOString(), dernier_echec: echec, dernier_echec_detail: 'HTTP 403 — Forbidden: bot was blocked by the user' };
+  const r1 = await runBoite({ site: { principal: direct(d) } });
+  assert.equal(r1.calls.telegram.length, 1);
+  const m = r1.calls.telegram[0];
+  assert.equal(m.silent, true);
+  assert.match(m.text, /Le bot du cockpit n’arrive plus à envoyer depuis 13:20 UTC \(HTTP 403 — Forbidden: bot was blocked by the user\)/);
+  assert.match(m.text, /ses alertes te parviennent quand même ici/);
+  assert.ok(lines(m.text) <= 3);
+  assert.ok(!r1.logs.join('\n').includes('Forbidden'), 'le détail ne va pas dans le journal public');
+  const r2 = await runBoite({ site: { principal: direct(d, null, T0 + 10 * MIN) } }, { prevState: r1.state, nowMs: T0 + 10 * MIN });
+  assert.equal(r2.calls.telegram.length, 0, 'une seule fois');
+  const bon = { ...d, dernier_ok: new Date(T0 + 15 * MIN).toISOString() };
+  const r3 = await runBoite({ site: { principal: direct(bon, null, T0 + 20 * MIN) } }, { prevState: r2.state, nowMs: T0 + 20 * MIN });
+  assert.equal(r3.calls.telegram.length, 0);
+  const r4 = await runBoite({ site: { principal: direct(bon, null, T0 + 90 * MIN) } }, { prevState: r3.state, nowMs: T0 + 90 * MIN });
+  assert.equal(r4.calls.telegram.length, 1);
+  assert.match(r4.calls.telegram[0].text, /^🟢 RÉSOLU — Envoi Telegram direct du cockpit/);
+});
+
+test('TELEGRAM COCKPIT — jamais envoyé avec succès : incident ; aucun échec : rien ; cockpit mort : rien', async () => {
+  const d = { configure: true, dernier_ok: null, dernier_echec: new Date(T0 - 5 * MIN).toISOString(), dernier_echec_detail: 'non configuré' };
+  const r = await runBoite({ site: { principal: direct(d) } });
+  assert.equal(r.calls.telegram.length, 1);
+  const calme = await runBoite({ site: { principal: direct({ configure: true, dernier_ok: null, dernier_echec: null }) } });
+  assert.equal(calme.calls.telegram.length, 0);
+  const mort = await runBoite({ site: { principal: { ...direct(d), surveillance_site: { actif: true, dernier_passage: new Date(T0 - 2 * H).toISOString() } } } });
+  assert.ok(!mort.calls.telegram.some((m) => /bot du cockpit/.test(m.text)));
+});
+
+test('TELEGRAM COCKPIT — le détail est nettoyé d’un éventuel jeton et borné', async () => {
+  const d = { configure: true, dernier_ok: null, dernier_echec: new Date(T0 - MIN).toISOString(), dernier_echec_detail: `HTTP 401 — bot123456:AAA-bbb_CCC Unauthorized ${'x'.repeat(300)}` };
+  const r = await runBoite({ site: { principal: direct(d) } });
+  assert.ok(!/bot123456/.test(r.calls.telegram[0].text));
+  assert.ok(r.calls.telegram[0].text.length < 500);
+});
+
+test('BOÎTE — plus ancien message du cockpit de plus de 30 min alors que le relais n’a rien relevé : incident « boîte »', async () => {
+  const sain = { configure: true, dernier_ok: new Date(T0).toISOString(), dernier_echec: null };
+  const ancien = (min) => direct(sain, new Date(T0 - min * MIN).toISOString());
+  // Sans jeton OIDC (lancement local ou manuel) : rien n’est relevé, mais /health dit que la boîte stagne.
+  const r1 = await runBoite({ site: { principal: ancien(45) } }, { env: SECOURS_ENV, nowMs: T0 });
+  const r2 = await runBoite({ site: { principal: ancien(55) } }, { env: SECOURS_ENV, prevState: r1.state, nowMs: T0 + 10 * MIN });
+  assert.equal(r2.calls.telegram.length, 1);
+  assert.match(r2.calls.telegram[0].text, /^🟠 IMPORTANT — Les alertes du cockpit ne te parviennent plus/);
+  assert.equal(r2.calls.health + r2.calls.page, 0, 'pas de repli : la boîte n’a pas été tentée');
+  // Récent (10 min) : rien.
+  const r3 = await runBoite({ site: { principal: ancien(10) } }, { env: SECOURS_ENV });
+  assert.equal(r3.state.pending.boite, undefined);
+});
+
+test('BOÎTE — journaux publics : ni jeton, ni texte d’alerte, ni corps de réponse', async () => {
+  const secret = 'TEXTE-ALERTE-CONFIDENTIEL';
+  const cas = [
+    await runBoite({ boite: boiteOk([bx(1, secret, true)]) }),
+    await runBoite({ boite: { status: 500, body: { detail: secret } } }),
+    await runBoite({ boite: { status: 200, badJson: true } }),
+    await runBoite({ boite: boiteOk([bx(1, secret)]), ack: { status: 401 } }),
+  ];
+  for (const r of cas) {
+    const all = r.logs.join('\n') + JSON.stringify(r.results.map(({ health, ...x }) => x));
+    for (const interdit of [secret, JWT, 'REQUEST-TOKEN-SECRET', BASE_ENV.TELEGRAM_BOT_TOKEN, 'a1b2c3d4']) {
+      assert.ok(!all.includes(interdit), `fuite dans le journal : ${interdit}`);
+    }
+  }
+});
