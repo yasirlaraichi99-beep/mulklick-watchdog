@@ -1033,7 +1033,10 @@ export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, no
       if (box.failed) failed = true;
       const k = checkAncienneteBoite(box, p, nowMs, cfg);
       // Boîte non relevable (404, 401, 5xx, réseau, JSON) : le relais refait LUI-MÊME les contrôles A à D.
-      const repli = box.kind === 'erreur' || box.kind === 'absent';
+      // Dans GitHub Actions sans jeton OIDC (permission id-token absente, lancement manuel par
+      // watchdog.yml) : la boîte ne peut pas être relevée, donc repli aussi — jamais le silence.
+      const sansJetonSurGitHub = box.kind === 'skip' && String(env.GITHUB_ACTIONS).toLowerCase() === 'true';
+      const repli = box.kind === 'erreur' || box.kind === 'absent' || sansJetonSurGitHub;
       if (k.status === 'crit') k.fallback = repli;
       results = [p, checkTelegramCockpit(p), k];
       if (repli) {

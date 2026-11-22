@@ -785,6 +785,18 @@ test('BOÎTE — sans PRINCIPAL_HEALTH_URL ou sans variables OIDC : mode histori
   assert.equal(sansUrl.seen.tokenUrl, null);
 });
 
+test('BOÎTE — dans GitHub Actions sans jeton OIDC : pas d’incident, mais les contrôles A à D sont faits (jamais le silence)', async () => {
+  const r = await runBoite({}, { env: { ...SECOURS_ENV, GITHUB_ACTIONS: 'true' } });
+  assert.equal(r.seen.tokenUrl, null);
+  assert.equal(r.calls.health, 1);
+  assert.equal(r.calls.page, 1);
+  assert.deepEqual(r.calls.telegram, []);
+  assert.equal(r.state.incidents.boite, undefined);
+  const down = await runBoite({ site: DOWN }, { env: { ...SECOURS_ENV, GITHUB_ACTIONS: 'true' } });
+  assert.equal(down.calls.telegram.length, 1);
+  assert.equal(down.calls.telegram[0].silent, false);
+});
+
 const direct = (d, plusAncien = null, now = T0) => ({ ...vivant(now - MIN), telegram: { direct: d, boite: { active: true, en_attente: 0, plus_ancien: plusAncien } } });
 
 test('TELEGRAM COCKPIT — échec plus récent que le dernier succès : un message silencieux avec le détail, une fois, clos après un succès postérieur', async () => {
