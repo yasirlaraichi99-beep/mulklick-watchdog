@@ -21,6 +21,7 @@ const EMPTY_HTML = `<html>${'<div>Aucune valeur actuelle</div>'.repeat(8)}${' '.
 const PARTIAL_HTML = `<html>${'<polyline data-spark=""></polyline>'.repeat(6)}${'<div>Aucune valeur actuelle</div>'.repeat(2)}</html>`;
 const cards = (n, state) => `<article data-card-state="${state}"></article>`.repeat(n);
 const PAD = ' '.repeat(30_000);
+const OPEN_HTML = `<html>${cards(8, 'value')}${PAD}</html>`;
 const RESERVED_HEALTHY_HTML = `<html>${cards(3, 'value')}${cards(5, 'reserved')}${PAD}</html>`;
 const RESERVED_EMPTY_HTML = `<html>${cards(8, 'empty')}${'<div>Aucune valeur actuelle</div>'.repeat(8)}${PAD}</html>`;
 const RESERVED_PARTIAL_HTML = `<html>${cards(3, 'value')}${cards(3, 'reserved')}${cards(2, 'empty')}${PAD}</html>`;
@@ -168,12 +169,36 @@ test('données absentes alors que la base répond : URGENT sonore', async () => 
   assert.match(r.calls.telegram[0].text, /^🔴 URGENT — Page publique sans données alors que la base répond/);
 });
 
-test('cartes réservées (3 en clair + 5 masquées) : aucun message, comptage lisible', async () => {
-  const r = await run({ pageHtml: RESERVED_HEALTHY_HTML });
+test('site ouvert : 8 cartes en clair → aucun message, comptage lisible', async () => {
+  const r = await run({ pageHtml: OPEN_HTML });
   assert.equal(r.calls.telegram.length, 0);
-  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: RESERVED_HEALTHY_HTML }).fetchImpl, sleep: async () => {} });
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: OPEN_HTML }).fetchImpl, sleep: async () => {} });
   assert.equal(b.status, 'ok');
-  assert.match(b.value, /8\/8 cartes avec donnée \(3 en clair, 5 masquées\), 0 vides/);
+  assert.match(b.value, /8\/8 cartes en clair, 0 masquées, 0 vides/);
+});
+
+test('site ouvert : 3 en clair + 5 masquées (masquage revenu) → avertissement, pas d’alarme', async () => {
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: RESERVED_HEALTHY_HTML }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'warn');
+  assert.match(b.value, /cartes masquées aux visiteurs .*: 3\/8 cartes en clair, 5 masquées, 0 vides/);
+});
+
+test('site ouvert : 8 masquées, aucune vide → avertissement (pas « marqueurs introuvables »)', async () => {
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: `<html>${cards(8, 'reserved')}${PAD}</html>` }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'warn');
+  assert.match(b.value, /cartes masquées aux visiteurs/);
+});
+
+test('site ouvert : 7 cartes en clair seulement (une carte disparue) → avertissement', async () => {
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: `<html>${cards(7, 'value')}${PAD}</html>` }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'warn');
+  assert.match(b.value, /cartes manquantes : 7\/8 cartes en clair/);
+});
+
+test('site ouvert : 7 en clair + 1 vide → avertissement (données partielles)', async () => {
+  const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: `<html>${cards(7, 'value')}${cards(1, 'empty')}${PAD}</html>` }).fetchImpl, sleep: async () => {} });
+  assert.equal(b.status, 'warn');
+  assert.match(b.value, /données partielles : 7\/8 cartes en clair, 0 masquées, 1 vides/);
 });
 
 test('cartes réservées : 8 vides → URGENT sonore', async () => {
@@ -183,16 +208,19 @@ test('cartes réservées : 8 vides → URGENT sonore', async () => {
   assert.match(r.calls.telegram[0].text, /^🔴 URGENT — Page publique sans données/);
 });
 
-test('cartes réservées : 6 présentes + 2 vides → avertissement (données partielles)', async () => {
+test('cartes réservées : 3 en clair + 3 masquées + 2 vides → avertissement (données partielles)', async () => {
   const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: RESERVED_PARTIAL_HTML }).fetchImpl, sleep: async () => {} });
   assert.equal(b.status, 'warn');
-  assert.match(b.value, /données partielles : 6\/8 cartes avec donnée \(3 en clair, 3 masquées\), 2 vides/);
+  assert.match(b.value, /données partielles : 3\/8 cartes en clair, 3 masquées, 2 vides/);
 });
 
 test('page avec data-spark ET data-card-state : une carte n’est comptée qu’une fois', async () => {
   const b = await checkPage({ fetchImpl: fakeNet({ pageHtml: MIXED_HTML }).fetchImpl, sleep: async () => {} });
-  assert.equal(b.status, 'ok');
-  assert.match(b.value, /8\/8 cartes avec donnée \(3 en clair, 5 masquées\)/);
+  assert.match(b.value, /3\/8 cartes en clair, 5 masquées/);
+  const open = `<html>${'<article data-card-state="value"><polyline data-spark=""></polyline></article>'.repeat(8)}${PAD}</html>`;
+  const o = await checkPage({ fetchImpl: fakeNet({ pageHtml: open }).fetchImpl, sleep: async () => {} });
+  assert.equal(o.status, 'ok');
+  assert.match(o.value, /^8\/8 cartes en clair/);
 });
 
 test('page blanche ou page d’erreur servie en 200 : URGENT, pas un simple avertissement', async () => {

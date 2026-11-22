@@ -5,10 +5,11 @@
 //
 // Quatre contrôles :
 //   A — panne      : GET /api/health → 200 et db_ok=true, 3 essais espacés de 20 s.
-//   B — page       : GET /fr/intelligence → les cartes nationales ont une donnée. Deux formats lus :
-//                    NOUVEAU (data-card-state="value|reserved|empty" : une donnée masquée aux visiteurs
-//                    non connectés compte comme présente) ou ANCIEN (courbes data-spark / « Aucune valeur
-//                    actuelle »). Le watchdog reste anonyme : aucune session, aucun cookie, aucune clé.
+//   B — page       : GET /fr/intelligence → les 8 cartes nationales AFFICHENT une valeur. Deux formats lus :
+//                    NOUVEAU (data-card-state="value|reserved|empty" ; site ouvert depuis le 21.11.2026 :
+//                    seule « value » compte, une carte masquée ou vide donne un avertissement) ou ANCIEN
+//                    (courbes data-spark / « Aucune valeur actuelle »). Le watchdog reste anonyme : aucune
+//                    session, aucun cookie, aucune clé.
 //   C — fraîcheur  : age_hours (rendu par /api/health) ≤ seuil.
 //   D — disque     : disk_level / disk_pct (rendus par /api/health), avec projection du remplissage.
 //
@@ -54,10 +55,10 @@ export const CONFIG = {
   // - carte AVEC donnée : la courbe <polyline data-spark="">, rendue seulement quand la carte a un
   //   score. La page en porte 8 quand tout va bien (environ 130 Ko de HTML).
   // Format ANCIEN ci-dessus, utilisé seulement si la page ne porte aucun « data-card-state= ».
-  // Format NOUVEAU (données réservées aux visiteurs connectés) : chaque carte porte
-  // data-card-state="value" (en clair), "reserved" (donnée présente mais masquée) ou "empty" (aucune
-  // donnée). Présent = value + reserved ; absent = empty. Les deux formats marchent, avant et après
-  // le déploiement du site.
+  // Format NOUVEAU : chaque carte porte data-card-state="value" (valeur affichée), "reserved" (donnée
+  // présente mais masquée) ou "empty" (aucune donnée). Depuis le site ouvert, présent = value seul ;
+  // reserved et empty donnent un avertissement. À merger APRÈS le site ouvert : avant, la page porte
+  // encore 5 cartes « reserved » et ce contrôle le signalerait.
   markerAbsent: 'Aucune valeur actuelle',
   markerPresent: 'data-spark=""',
   markerCardState: 'data-card-state=',
@@ -244,14 +245,16 @@ export async function checkPage({ fetchImpl, sleep, cfg = CONFIG }) {
         const html = await res.text();
         let absent;
         let present;
+        let hidden = 0;
         let counts;
         if (countOccurrences(html, cfg.markerCardState) > 0) {
           // Nouveau format : un seul marqueur par carte, pas de double comptage avec data-spark.
-          const clear = countOccurrences(html, cfg.markerCardValue);
-          const hidden = countOccurrences(html, cfg.markerCardReserved);
+          // SITE OUVERT (21.11.2026) : seule une carte « value » (valeur affichée) compte. Une carte
+          // « reserved » est une donnée masquée aux visiteurs, ce qui ne doit plus arriver.
+          present = countOccurrences(html, cfg.markerCardValue);
+          hidden = countOccurrences(html, cfg.markerCardReserved);
           absent = countOccurrences(html, cfg.markerCardEmpty);
-          present = clear + hidden;
-          counts = `${present}/${cfg.expectedCards} cartes avec donnée (${clear} en clair, ${hidden} masquées), ${absent} vides`;
+          counts = `${present}/${cfg.expectedCards} cartes en clair, ${hidden} masquées, ${absent} vides`;
         } else {
           absent = countOccurrences(html, cfg.markerAbsent);
           present = countOccurrences(html, cfg.markerPresent);
@@ -259,11 +262,15 @@ export async function checkPage({ fetchImpl, sleep, cfg = CONFIG }) {
         }
         // Les marqueurs dépendent du contenu, pas du réseau : inutile de réessayer.
         if (present === 0 && absent > 0) return { id: 'B', status: 'crit', value: `données absentes : ${counts}` };
-        if (present === 0 && html.length < cfg.minPageBytes) {
+        if (present === 0 && hidden === 0 && html.length < cfg.minPageBytes) {
           return { id: 'B', status: 'crit', value: `page vide ou page d'erreur (${html.length} octets, aucun marqueur)` };
         }
-        if (present === 0) return { id: 'B', status: 'warn', value: `marqueurs introuvables (page modifiée ?) : ${counts}` };
+        if (present === 0 && hidden === 0) {
+          return { id: 'B', status: 'warn', value: `marqueurs introuvables (page modifiée ?) : ${counts}` };
+        }
         if (absent > 0) return { id: 'B', status: 'warn', value: `données partielles : ${counts}` };
+        if (hidden > 0) return { id: 'B', status: 'warn', value: `cartes masquées aux visiteurs (le site doit être ouvert) : ${counts}` };
+        if (present < cfg.expectedCards) return { id: 'B', status: 'warn', value: `cartes manquantes : ${counts}` };
         return { id: 'B', status: 'ok', value: counts };
       }
     } catch (e) {
