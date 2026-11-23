@@ -491,7 +491,7 @@ function gapText(fromMs, toMs) {
   return [
     `🟠 IMPORTANT — Le watchdog n’a pas tourné pendant ${fmtDuration(toMs - fromMs)} (du ${fmtUtc(fromMs)} au ${fmtUtc(toMs)}).`,
     'Gravité : rien n’a été surveillé pendant ce temps ; il tourne de nouveau.',
-    'Action : vérifier l’historique de cron-job.org et l’onglet Actions de mulklick-watchdog.',
+    'Action : GitHub → mulklick-watchdog → Actions → « Relais du secours » : lire le passage en échec ; si la chaîne est arrêtée, cliquer « Run workflow ».',
   ].join('\n');
 }
 
