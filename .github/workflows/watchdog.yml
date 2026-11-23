@@ -8,7 +8,7 @@ name: Watchdog Mulklick
 # Aucun déclencheur pull_request : un fork ne peut rien lancer ici.
 #
 # Depuis le 21.11.2026 : les passages automatiques (toutes les 10 min) sont faits par relais.yml.
-# Ce workflow ne sert plus qu'au lancement manuel (test) et au garde-vie mensuel du dépôt.
+# Ce workflow ne sert plus qu'au lancement manuel (aucun message de test : la règle Telegram du 23.11 les interdit) et au garde-vie mensuel du dépôt.
 # Un lancement manuel partage le groupe de concurrence du relais : à éviter sans raison.
 
 on:
@@ -16,11 +16,6 @@ on:
     # Garde-vie : GitHub désactive le cron d'un dépôt public après 60 jours sans activité.
     - cron: '17 6 1 * *'
   workflow_dispatch:
-    inputs:
-      test:
-        description: 'Envoyer un message Telegram de test même si tout va bien'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -57,7 +52,6 @@ jobs:
           # Mode secours : signe de vie de la surveillance principale (route publique /health du
           # cockpit). Présent → ce workflow se tait tant que le cockpit tourne, et alerte sinon.
           PRINCIPAL_HEALTH_URL: ${{ secrets.PRINCIPAL_HEALTH_URL }}
-          WATCHDOG_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
           WATCHDOG_STATE_FILE: .watchdog-state/state.json
 
       - name: Mémoriser l'état

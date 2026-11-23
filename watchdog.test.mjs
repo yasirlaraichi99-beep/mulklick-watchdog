@@ -7,14 +7,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runOnce, planRun, zurichNow, weekKey, projectDiskDays, updateDiskSteps, normalizeState, CONFIG, checkPage } from './watchdog.mjs';
+import { runOnce, planRun, projectDiskDays, updateDiskSteps, normalizeState, CONFIG, checkPage } from './watchdog.mjs';
 
 const MIN = 60_000;
 const H = 60 * MIN;
 const DAY = 24 * H;
 const T0 = Date.UTC(2026, 10, 19, 14, 0); // jeu. 19.11.2026 14:00 UTC (15:00 heure suisse)
 const TUE_17_MIDNIGHT_CH = Date.UTC(2026, 10, 16, 23, 0); // mar. 17.11.2026 00:00 heure suisse
-const MON_23_0800_CH = Date.UTC(2026, 10, 23, 7, 0); // lun. 23.11.2026 08:00 heure suisse
 
 const HEALTHY_HTML = `<html>${'<polyline data-spark="" points="0,1 2,3"></polyline>'.repeat(8)}${' '.repeat(30_000)}</html>`;
 const EMPTY_HTML = `<html>${'<div>Aucune valeur actuelle</div>'.repeat(8)}${' '.repeat(30_000)}</html>`;
@@ -118,7 +117,6 @@ async function simulate({ start, runs, site = () => ({}), env = {}, prevState = 
 }
 
 const lines = (text) => text.split('\n').length;
-const notWeekly = (msgs) => msgs.filter((m) => !m.text.startsWith('📋'));
 
 // ───────────────────────────── contrôles et niveaux ─────────────────────────────
 
@@ -235,20 +233,23 @@ test('données trop anciennes : IMPORTANT silencieux ; week-end normal (110 h) :
   assert.equal(weekend.calls.telegram.length, 0);
 });
 
-test('disque : 70 % IMPORTANT silencieux, 85 % s’aggrave (silencieux), 90 % URGENT sonore', async () => {
+test('disque : 70 % IMPORTANT silencieux ; 85 % et 90 % : rien (pas d’aggravation) ; 95 % (lecture seule) : UN message URGENT sonore', async () => {
   const r1 = await run(disk(70));
   assert.equal(r1.calls.telegram.length, 1);
   assert.equal(r1.calls.telegram[0].silent, true);
   assert.match(r1.calls.telegram[0].text, /^🟠 IMPORTANT — Disque de la base ≈ 70 % de 18 GB\./);
   const r2 = await run(disk(85), { prevState: r1.state, nowMs: T0 + 10 * MIN });
-  assert.equal(r2.calls.telegram.length, 1);
-  assert.equal(r2.calls.telegram[0].silent, true);
-  assert.match(r2.calls.telegram[0].text, /^🟠 IMPORTANT — S’AGGRAVE : Disque de la base ≈ 85 %/);
+  assert.equal(r2.calls.telegram.length, 0, 'aucune aggravation');
   const r3 = await run(disk(90), { prevState: r2.state, nowMs: T0 + 20 * MIN });
-  assert.equal(r3.calls.telegram.length, 1);
-  assert.equal(r3.calls.telegram[0].silent, false);
-  assert.match(r3.calls.telegram[0].text, /^🔴 URGENT — S’AGGRAVE : Disque de la base ≈ 90 %/);
-  assert.match(r3.calls.telegram[0].text, /risque sous 48 h/);
+  assert.equal(r3.calls.telegram.length, 0, '90 % : encore un risque, pas une panne');
+  const r4 = await run(disk(95), { prevState: r3.state, nowMs: T0 + 30 * MIN });
+  assert.equal(r4.calls.telegram.length, 1);
+  assert.equal(r4.calls.telegram[0].silent, false);
+  assert.match(r4.calls.telegram[0].text, /^🔴 URGENT — Disque de la base ≈ 95 %/);
+  assert.match(r4.calls.telegram[0].text, /lecture seule/);
+  assert.match(r4.calls.telegram[0].text, /Depuis 19\.11 14:00 UTC/, 'depuis l’ouverture de l’incident');
+  const r5 = await run(disk(95), { prevState: r4.state, nowMs: T0 + 40 * MIN });
+  assert.equal(r5.calls.telegram.length, 0, 'jamais de rappel');
 });
 
 test('disque : projection du remplissage sur les paliers franchis en observation (≥ 12 h)', () => {
@@ -266,13 +267,13 @@ test('disque : projection du remplissage sur les paliers franchis en observation
   assert.deepEqual(Object.keys(updateDiskSteps(steps, 45, 13 * DAY)), ['45'], 'nettoyage réel : on repart de zéro');
 });
 
-test('disque : remplissage rapide et soutenu → URGENT avant même 90 %', async () => {
+test('disque : remplissage rapide et soutenu (« sous 48 h ») : IMPORTANT sans son, jamais urgent tant que la base n’est pas en lecture seule', async () => {
   // 70 % au départ, 75 % à +12 h, 80 % à +24 h, un passage toutes les 10 minutes.
   const s = await simulate({ start: T0, runs: 145, site: (i) => disk(i < 72 ? 70 : i < 144 ? 75 : 80) });
-  assert.equal(s.sent.length, 2);
-  assert.equal(s.sent[0].silent, true, 'ouverture à 70 % : important');
-  assert.equal(s.sent[1].silent, false);
-  assert.match(s.sent[1].text, /^🔴 URGENT — S’AGGRAVE : Disque de la base ≈ 80 % de 18 GB, plein \(95 %\) dans ≈ 1 j/);
+  assert.equal(s.sent.length, 1, 'une seule ouverture : ni aggravation ni alerte sonore');
+  assert.equal(s.sent[0].silent, true);
+  assert.equal(s.state.incidents.disque.level, 'important');
+  assert.match(s.state.incidents.disque.symptom, /plein \(95 %\) dans ≈ 1 j/);
 });
 
 test('disque : hystérésis, pas de yo-yo autour de 65 %', async () => {
@@ -280,14 +281,14 @@ test('disque : hystérésis, pas de yo-yo autour de 65 %', async () => {
   assert.equal(s.sent.length, 1, 'une ouverture, aucune clôture tant qu’on reste à ≥ 60 %');
 });
 
-test('disque : yo-yo 90 ↔ 85 % → une seule alerte sonore', async () => {
+test('disque : yo-yo 90 ↔ 85 % → un seul message, silencieux', async () => {
   const s = await simulate({ start: T0, runs: 36, site: (i) => disk(i % 2 ? 85 : 90) });
-  assert.equal(s.sound.length, 1);
-  assert.equal(s.silent.length, 0);
+  assert.equal(s.sound.length, 0);
+  assert.equal(s.silent.length, 1);
 });
 
 test('disque illisible pendant une alerte disque : pas de faux « s’améliore », cause distincte', async () => {
-  const r1 = await run(disk(90));
+  const r1 = await run(disk(95));
   assert.equal(r1.calls.telegram[0].silent, false);
   const unreadable = { healthBody: { ...HEALTH_OK, disk_level: null, disk_pct: null } };
   const s = await simulate({ start: T0 + 10 * MIN, runs: 3, site: () => unreadable, prevState: r1.state });
@@ -295,18 +296,44 @@ test('disque illisible pendant une alerte disque : pas de faux « s’améliore 
   assert.equal(s.sent[0].silent, true);
   assert.match(s.sent[0].text, /^🟠 IMPORTANT — Niveau du disque illisible/);
   assert.ok(s.state.incidents.disque, 'l’alerte disque reste ouverte telle quelle');
-  const back = await run(disk(90), { prevState: s.state, nowMs: T0 + 40 * MIN });
-  assert.equal(back.calls.telegram.filter((m) => !m.silent).length, 0, 'pas de nouvelle alerte sonore pour le même 90 %');
+  const back = await run(disk(95), { prevState: s.state, nowMs: T0 + 40 * MIN });
+  assert.equal(back.calls.telegram.filter((m) => !m.silent).length, 0, 'pas de nouvelle alerte sonore pour le même 95 %');
 });
 
-test('résolution : message silencieux après 1 h de retour à la normale', async () => {
+test('résolution : UN message RÉSOLU sans son après 1 h de retour à la normale, avec durée ET cause (dernier symptôme mesuré)', async () => {
   const r1 = await run(DOWN);
   const s = await simulate({ start: T0 + 10 * MIN, runs: 7, prevState: r1.state });
   assert.equal(s.sent.length, 1);
   assert.equal(s.sent[0].i, 6, 'clos au 7e passage normal (1 h)');
   assert.equal(s.sent[0].silent, true);
-  assert.match(s.sent[0].text, /^🟢 RÉSOLU — Base de données \/ API santé : revenu à la normale le 19\.11 14:10 UTC, après 10 min\./);
-  assert.ok(lines(s.sent[0].text) <= 3);
+  assert.equal(
+    s.sent[0].text,
+    '🟢 RÉSOLU — Base de données / API santé : 10 min (19.11 14:00 → 19.11 14:10 UTC).\nCause : HTTP 503, db_ok=false (3 essais à 20 s).',
+  );
+  assert.equal(lines(s.sent[0].text), 2);
+});
+
+test('résolution d’un incident IMPORTANT : même format, cause = dernier symptôme mesuré (le dernier, pas le premier)', async () => {
+  const s = await simulate({
+    start: T0, runs: 30,
+    site: (i) => (i < 6 ? { healthBody: { ...HEALTH_OK, latest_capture: '2026-11-14', age_hours: 130 } } : i < 12 ? { healthBody: { ...HEALTH_OK, latest_capture: '2026-11-14', age_hours: 140 } } : {}),
+  });
+  assert.equal(s.sent.length, 2);
+  assert.equal(s.sent[0].silent, true);
+  assert.match(s.sent[0].text, /^🟠 IMPORTANT — Données de marché trop anciennes/);
+  assert.equal(s.sent[1].silent, true);
+  assert.match(s.sent[1].text, /^🟢 RÉSOLU — Fraîcheur des données de marché : 2 h \(19\.11 14:00 → 19.11 16:00 UTC\)\.\nCause : dernière capture 2026-11-14, âge 140 h/);
+});
+
+test('résolution sans symptôme enregistré : « non identifiée par la surveillance »', () => {
+  const prev = {
+    version: 2, incidents: { site: { level: 'important', panne: false, openedAt: T0, notifiedAt: T0, okSince: T0 + 10 * MIN } },
+    pending: {}, diskSteps: {}, lastRunAt: T0 + 60 * MIN, heartbeatFails: 0,
+  };
+  const results = [{ id: 'A', status: 'ok', value: 'ok', health: {} }, { id: 'B', status: 'ok', value: 'ok' }, { id: 'C', status: 'ok', value: 'ok' }, { id: 'D', status: 'ok', value: 'ok', level: 'ok', pct: 50 }];
+  const { messages } = planRun(prev, results, T0 + 70 * MIN, BASE_ENV);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].text, /\nCause : non identifiée par la surveillance\.$/);
 });
 
 test('même cause : base revenue mais page encore vide (cache) → pas de nouveau message', async () => {
@@ -319,43 +346,53 @@ test('même cause : base revenue mais page encore vide (cache) → pas de nouvea
   assert.match(s.silent[0].text, /^🟢 RÉSOLU — Base de données/);
 });
 
-test('récidive : un problème revenu < 6 h après sa clôture → un seul message silencieux', async () => {
+test('un problème revenu APRÈS son « résolu » est un nouvel incident : ouverture normale (sonore), sans étiquette « RÉCIDIVE »', async () => {
   const s = await simulate({ start: T0, runs: 50, site: (i) => (i === 0 || i === 8 ? DOWN : {}) });
-  assert.equal(s.sound.length, 1, 'seule la première panne sonne');
-  assert.equal(s.silent.length, 3, 'clôture, récidive, clôture finale');
-  assert.match(s.silent[1].text, /^🔁 URGENT — RÉCIDIVE : Base de données/);
-  assert.equal(s.silent[2].i, 45, 'après une récidive, clôture après 6 h normales');
+  assert.equal(s.sound.length, 2, 'chaque panne ouvre normalement avec son');
+  assert.equal(s.silent.length, 2, 'un RÉSOLU par panne');
+  assert.ok(s.sent.every((m) => !/RÉCIDIVE|🔁/.test(m.text)));
+  assert.match(s.sound[1].text, /^🔴 URGENT — Base de données ou \/api\/health injoignable/);
+  assert.match(s.silent[0].text, /^🟢 RÉSOLU/);
+  assert.match(s.silent[1].text, /^🟢 RÉSOLU/);
 });
 
-test('plafond : au-delà de 3 alertes sonores/jour hors panne → regroupé en silencieux (3 lignes), redonné avec son le lendemain', async () => {
-  const day = zurichNow(T0).date;
-  const prev = { version: 2, sound: { day, count: 3 }, lastWeeklyKey: weekKey(T0), lastRunAt: T0 - 10 * MIN, period: { since: T0 - H } };
+test('aucun rappel, aucune aggravation, aucun regroupement : même problème qui dure 3 jours, même s’il change de gravité interne', async () => {
+  const s = await simulate({
+    start: T0, runs: 3 * 144,
+    site: (i) => disk(i < 100 ? 65 : i < 200 ? 85 : i < 300 ? 90 : 70),
+  });
+  assert.equal(s.sent.length, 1, 'un seul message d’ouverture, jamais de rappel ni d’aggravation ni d’amélioration');
+  assert.ok(s.sent.every((m) => !/S’AGGRAVE|S’AMÉLIORE|TOUJOURS EN COURS|REGROUPÉ|RÉCIDIVE|🔕|🔁/.test(m.text)));
+  assert.equal(s.sound.length, 0);
+});
+
+test('plusieurs pannes le même jour : chacune avec son, jamais de plafond ni de message « REGROUPÉ »', () => {
   const results = [
     { id: 'A', status: 'ok', value: 'ok', health: {} },
-    { id: 'B', status: 'ok', value: 'ok' },
+    { id: 'B', status: 'crit', value: 'données absentes : 0/8 cartes chiffrées, 8 « Aucune valeur actuelle »' },
     { id: 'C', status: 'ok', value: 'ok' },
-    { id: 'D', status: 'crit', value: 'x', level: 'critique', pct: 90 },
+    { id: 'D', status: 'crit', value: 'x', level: 'critique', pct: 95 },
+    { id: 'P', status: 'crit', value: 'cockpit injoignable (erreur réseau)' },
   ];
-  const { messages } = planRun(prev, results, T0, BASE_ENV);
-  assert.equal(messages.length, 1);
-  assert.equal(messages[0].sound, false);
-  assert.ok(lines(messages[0].text) <= 3);
-  assert.match(messages[0].text, /^🔕 REGROUPÉ — 1 alerte urgente sans son \(plafond de 3 alertes sonores par jour atteint\) : Disque de la base\./);
-  // Une panne en cours n'est jamais plafonnée.
-  const down = [{ id: 'A', status: 'crit', value: 'HTTP 503' }, { id: 'B', status: 'ok', value: 'ok' }, { id: 'C', status: 'skip', value: '-' }, { id: 'D', status: 'skip', value: '-' }];
-  assert.equal(planRun(prev, down, T0, BASE_ENV).messages[0].sound, true);
-  // En vrai : envoi regroupé, puis le lendemain l'alerte encore ouverte repart AVEC son.
-  const st = normalizeState(prev, T0);
-  const p1 = planRun(st, results, T0, BASE_ENV);
-  p1.messages.forEach((m) => m.commit(p1.state));
-  assert.equal(p1.state.incidents.disque.mutedByCap, true);
-  const p2 = planRun(JSON.parse(JSON.stringify(p1.state)), results, T0 + 10 * MIN, BASE_ENV);
-  assert.equal(p2.messages.length, 0, 'pas de répétition le même jour');
-  const nextDay = { ...JSON.parse(JSON.stringify(p1.state)), lastRunAt: T0 + DAY - 10 * MIN }; // le watchdog a tourné entre-temps
-  const p3 = planRun(nextDay, results, T0 + DAY, BASE_ENV);
-  assert.equal(p3.messages.length, 1);
-  assert.equal(p3.messages[0].sound, true);
-  assert.match(p3.messages[0].text, /^🔴 URGENT — TOUJOURS EN COURS/);
+  const prev = { version: 2, lastRunAt: T0 - 10 * MIN, sound: { day: '2026-11-19', count: 99 } };
+  const { messages } = planRun(prev, results, T0, { ...BASE_ENV, PRINCIPAL_HEALTH_URL: 'https://cockpit.example/health' });
+  assert.equal(messages.length, 3);
+  assert.deepEqual(messages.map((m) => [m.key, m.sound]).sort(), [['disque', true], ['principal', false], ['site', true]]);
+  assert.ok(messages.every((m) => !/REGROUPÉ|🔕/.test(m.text)));
+});
+
+test('un seul message URGENT après un IMPORTANT : le risque devenu panne, puis plus rien', async () => {
+  const s = await simulate({
+    start: T0, runs: 60,
+    site: (i) => (i < 10 ? disk(70) : i < 20 ? disk(95) : i < 30 ? disk(90) : disk(95)),
+  });
+  assert.equal(s.sent.length, 2, 'ouverture IMPORTANT puis UN message URGENT, rien ensuite (ni retombée, ni nouvelle montée)');
+  assert.equal(s.sent[0].silent, true);
+  assert.match(s.sent[0].text, /^🟠 IMPORTANT — Disque/);
+  assert.equal(s.sent[1].silent, false);
+  assert.match(s.sent[1].text, /^🔴 URGENT — Disque/);
+  assert.match(s.sent[1].text, /Depuis 19\.11 14:00 UTC/);
+  assert.equal(s.sent[1].i, 10);
 });
 
 test('échec Telegram : job en échec, alerte renvoyée au passage suivant avec son heure d’origine, jeton jamais journalisé', async () => {
@@ -379,15 +416,12 @@ test('échec Telegram au moment de confirmer une anomalie : elle part au passage
   assert.match(r3.calls.telegram[0].text, /^🟠 IMPORTANT — Page publique incomplète/);
 });
 
-test('mode test : résumé silencieux des 4 contrôles', async () => {
+test('plus de message de test : WATCHDOG_TEST est sans effet', async () => {
   const r = await run({}, { env: { WATCHDOG_TEST: 'true' } });
-  assert.equal(r.calls.telegram.length, 1);
-  assert.equal(r.calls.telegram[0].silent, true);
-  assert.match(r.calls.telegram[0].text, /^🧪 TEST — Watchdog Mulklick/);
-  assert.match(r.calls.telegram[0].text, /✅ D : ≈ 50 %/);
+  assert.equal(r.calls.telegram.length, 0);
 });
 
-test('preuve de vie : arrêt > 2 h signalé en silencieux à la reprise (renvoyé si Telegram échoue) ; 70 min : résumé seulement', async () => {
+test('preuve de vie : arrêt > 2 h signalé en silencieux à la reprise (renvoyé si Telegram échoue) ; 70 min : rien', async () => {
   const r1 = await run({});
   const fail = await run({ telegramFails: true }, { prevState: r1.state, nowMs: T0 + 3 * H });
   assert.equal(fail.exitCode, 1);
@@ -396,80 +430,66 @@ test('preuve de vie : arrêt > 2 h signalé en silencieux à la reprise (renvoy�
   assert.equal(r2.calls.telegram[0].silent, true);
   assert.match(r2.calls.telegram[0].text, /^🟠 IMPORTANT — Le watchdog n’a pas tourné pendant 3 h \(du 19\.11 14:00 UTC au 19\.11 17:00 UTC\)/);
   const r3 = await run({}, { prevState: r2.state, nowMs: T0 + 4 * H + 20 * MIN });
-  assert.equal(r3.calls.telegram.length, 0, '70 min : information seulement');
-  assert.equal(r3.state.period.gaps.length, 2);
+  assert.equal(r3.calls.telegram.length, 0, '70 min : rien');
 });
 
-test('preuve de vie : contrôleur externe pingé à chaque passage ; muet 3 fois → URGENT ; revenu → clôture', async () => {
+test('preuve de vie : contrôleur externe pingé à chaque passage ; muet 3 fois → IMPORTANT sans son (un risque) ; revenu → RÉSOLU', async () => {
   const ok = await run({}, { env: HB_ENV });
   assert.deepEqual(ok.calls.pings, ['/uuid-de-test']);
   const down = await simulate({ start: T0 + 10 * MIN, runs: 4, env: HB_ENV, prevState: ok.state, site: () => ({ heartbeatDown: true }) });
   assert.equal(down.sent.length, 1);
-  assert.equal(down.sent[0].silent, false);
-  assert.match(down.sent[0].text, /^🔴 URGENT — Le contrôleur de vie du watchdog ne répond plus/);
+  assert.equal(down.sent[0].silent, true);
+  assert.match(down.sent[0].text, /^🟠 IMPORTANT — Le contrôleur de vie du watchdog ne répond plus/);
   const back = await simulate({ start: T0 + 50 * MIN, runs: 9, env: HB_ENV, prevState: down.state });
   assert.equal(back.sent.length, 1);
-  assert.match(back.sent[0].text, /^🟢 RÉSOLU — Contrôleur de vie du watchdog/);
+  assert.match(back.sent[0].text, /^🟢 RÉSOLU — Contrôleur de vie du watchdog : .*\nCause : 4 signaux de vie refusés\./);
   const fail = await run({ ...DOWN, telegramFails: true }, { env: HB_ENV });
   assert.deepEqual(fail.calls.pings, ['/uuid-de-test/fail'], 'Telegram en panne : le contrôleur externe est prévenu');
 });
 
-test('état illisible ou tronqué : complété ou repris à zéro sans planter', async () => {
+test('état illisible ou tronqué : complété ou repris à zéro sans planter ; anciens champs et anciennes causes écartés sans message', async () => {
   const r = await run({}, { prevState: { version: 2, incidents: null, period: 'x' } });
   assert.equal(r.exitCode, 0);
   assert.equal(r.calls.telegram.length, 0);
-  assert.equal(normalizeState({ version: 1, checks: {} }, T0).period.reset, false, 'ancienne version : migration connue');
-  assert.equal(normalizeState('corrompu', T0).period.reset, true);
-});
-
-test('heure suisse et clé de semaine', () => {
-  assert.deepEqual(zurichNow(MON_23_0800_CH), { date: '2026-11-23', hour: 8, weekday: 1, label: '23.11.2026 08:00', short: '23.11' });
-  assert.equal(zurichNow(Date.UTC(2026, 6, 6, 6, 0)).hour, 8, 'heure d’été : 06:00 UTC = 08:00');
-  assert.equal(weekKey(MON_23_0800_CH - MIN), '2026-11-16', 'lundi 07:59 : encore la semaine précédente');
-  assert.equal(weekKey(MON_23_0800_CH), '2026-11-23');
+  assert.equal(normalizeState('corrompu').version, 2);
+  const vieux = normalizeState({
+    version: 2, sound: { day: 'x', count: 3 }, period: { since: 1 }, closed: { site: {} }, lastWeeklyKey: '2026-11-16',
+    incidents: { telegram_cockpit: { level: 'important', openedAt: 1, okSince: 2 }, site: { level: 'important', openedAt: 1, okSince: null } },
+    pending: { telegram_cockpit: { seen: 1, first: 1 } },
+  });
+  assert.deepEqual(Object.keys(vieux.incidents), ['site']);
+  assert.deepEqual(vieux.pending, {});
+  for (const k of ['sound', 'period', 'closed', 'lastWeeklyKey']) assert.ok(!(k in vieux), k);
+  const res = await run({}, { prevState: { version: 2, incidents: { telegram_cockpit: { level: 'important', openedAt: 1, okSince: 2 } } } });
+  assert.equal(res.calls.telegram.length, 0, 'ancien incident « telegram_cockpit » : jamais de « résolu » orphelin');
 });
 
 // ───────────────────────────── banc d'essai : bruit ─────────────────────────────
 
-test('BANC — semaine sans incident : 0 message sonore, 1 seul silencieux (résumé du lundi)', async () => {
+test('BANC — semaine sans incident : AUCUN message (plus de résumé du lundi : le bilan est celui du cockpit)', async () => {
   const s = await simulate({ start: TUE_17_MIDNIGHT_CH, runs: 7 * 144, env: HB_ENV });
-  assert.equal(s.sound.length, 0);
-  assert.equal(s.silent.length, 1);
-  const w = s.silent[0];
-  assert.equal(new Date(w.t).toISOString(), '2026-11-23T07:00:00.000Z', 'lundi 08:00 heure suisse');
-  assert.equal(lines(w.text), 3);
-  // Du mardi 00:00 au lundi 08:00 inclus : 6 j 8 h = 912 intervalles, 913 passages.
-  assert.match(w.text, /^📋 Semaine du 17\.11 au 23\.11 : aucun incident\.\nSurveillance : 913 passages sur ≈ 913 · disque ≈ 50 % de 18 GB \(stable\) · dernière capture 2026-11-19\.\nAction : aucune\.$/);
+  assert.equal(s.sent.length, 0);
   assert.equal(s.pings, 7 * 144, 'un signal de vie par passage');
   assert.equal(s.failedRuns, 0);
 });
 
-test('BANC — même semaine sans contrôleur de vie configuré : toujours 1 seul message, qui le rappelle', async () => {
-  const s = await simulate({ start: TUE_17_MIDNIGHT_CH, runs: 7 * 144 });
-  assert.equal(s.sound.length, 0);
-  assert.equal(s.silent.length, 1);
-  assert.match(s.silent[0].text, /Action : contrôleur de vie externe non configuré\./);
-});
-
-test('BANC — semaine sans incident avec 2 retards du déclencheur de 70 min : toujours 0 sonore, 1 silencieux', async () => {
+test('BANC — même semaine sans contrôleur de vie, avec 2 retards du déclencheur de 70 min : toujours aucun message', async () => {
   const s = await simulate({ start: TUE_17_MIDNIGHT_CH, runs: 7 * 144, skip: (i) => (i > 200 && i < 207) || (i > 600 && i < 607) });
-  assert.equal(s.sound.length, 0);
-  assert.equal(s.silent.length, 1);
-  assert.match(s.silent[0].text, /, 2 interruptions ·/);
+  assert.equal(s.sent.length, 0);
 });
 
 test('BANC — panne de 2 h : 1 sonore (ouverture) + 1 silencieux (clôture)', async () => {
   const s = await simulate({ start: T0, runs: 30, site: (i) => (i >= 3 && i < 15 ? { ...DOWN, pageHtml: EMPTY_HTML } : {}) });
   assert.equal(s.sound.length, 1);
   assert.equal(s.silent.length, 1);
-  assert.match(s.silent[0].text, /après 2 h/);
+  assert.match(s.silent[0].text, /^🟢 RÉSOLU — .* : 2 h \(/);
 });
 
 test('BANC — panne de 14 h : aucune répétition, 1 sonore + 1 silencieux', async () => {
   const s = await simulate({ start: T0, runs: 100, site: (i) => (i >= 2 && i < 86 ? DOWN : {}) });
   assert.equal(s.sound.length, 1);
   assert.equal(s.silent.length, 1);
-  assert.match(s.silent[0].text, /après 14 h/);
+  assert.match(s.silent[0].text, /^🟢 RÉSOLU — .* : 14 h \(/);
 });
 
 test('BANC — panne en yo-yo pendant 3 h (KO/OK à chaque passage) : 1 sonore + 1 silencieux', async () => {
@@ -496,41 +516,53 @@ test('BANC — anomalie importante en yo-yo (2 mauvais, 2 bons) pendant 24 h : 2
   assert.equal(s.silent.length, 2);
 });
 
-test('BANC — scraper en retard 3 jours puis reparti : 0 sonore, 2 silencieux (signalement + clôture)', async () => {
+test('BANC — scraper en retard 3 jours puis reparti : 0 sonore, 2 silencieux (ouverture + RÉSOLU)', async () => {
   const s = await simulate({
     start: T0, runs: 4 * 144,
     site: (i) => ({ healthBody: { ...HEALTH_OK, age_hours: i < 3 * 144 ? 130 + i / 6 : 10 } }),
   });
   assert.equal(s.sound.length, 0);
-  assert.equal(notWeekly(s.silent).length, 2);
+  assert.equal(s.silent.length, 2);
 });
 
-test('BANC — à-coup d’une nuit de scraping (60 → 70 % en 1 h) puis plat : 0 sonore, 1 silencieux hors résumé', async () => {
+test('BANC — à-coup d’une nuit de scraping (60 → 70 % en 1 h) puis plat : 0 sonore, 1 silencieux', async () => {
   // Jeudi 19.11 : 65 % à 03:30, 70 % à 04:30 (heure suisse), puis plus rien pendant la semaine.
   const s = await simulate({
     start: TUE_17_MIDNIGHT_CH, runs: 7 * 144,
     site: (i) => disk(i < 2 * 144 + 21 ? 60 : i < 2 * 144 + 27 ? 65 : 70),
   });
   assert.equal(s.sound.length, 0);
-  assert.equal(notWeekly(s.silent).length, 1);
-  assert.match(notWeekly(s.silent)[0].text, /^🟠 IMPORTANT — Disque de la base ≈ 65 % de 18 GB\./);
+  assert.equal(s.silent.length, 1);
+  assert.match(s.silent[0].text, /^🟠 IMPORTANT — Disque de la base ≈ 65 % de 18 GB\./);
 });
 
-test('BANC — disque qui monte de 50 à 92 % en 3 semaines : 1 seul sonore, 3 silencieux au plus hors résumés', async () => {
+test('BANC — disque qui monte de 50 à 92 % en 3 semaines : AUCUN message sonore, 1 seul silencieux', async () => {
+  const runs = 21 * 144;
+  const mont = (top) => (i) => {
+    const exact = 50 + ((top - 50) * i) / runs;
+    const pct = Math.floor(exact / 5) * 5;
+    const lvl = exact >= 80 ? 'critique' : exact >= 65 ? 'avertissement' : 'ok';
+    return { healthBody: { ...HEALTH_OK, disk_level: lvl, disk_pct: pct } };
+  };
+  const s = await simulate({ start: TUE_17_MIDNIGHT_CH, runs, site: mont(92) });
+  assert.equal(s.sound.length, 0, 'même « sous 48 h » : un risque, pas une panne');
+  assert.equal(s.silent.length, 1);
+});
+
+test('BANC — disque qui atteint 95 % (lecture seule) : 1 silencieux (risque) puis 1 sonore (panne), rien d’autre', async () => {
   const runs = 21 * 144;
   const s = await simulate({
     start: TUE_17_MIDNIGHT_CH, runs,
     site: (i) => {
-      const exact = 50 + (42 * i) / runs;
+      const exact = 50 + (46 * i) / runs;
       const pct = Math.floor(exact / 5) * 5;
       const lvl = exact >= 80 ? 'critique' : exact >= 65 ? 'avertissement' : 'ok';
       return { healthBody: { ...HEALTH_OK, disk_level: lvl, disk_pct: pct } };
     },
   });
-  assert.equal(s.sound.length, 1, 'une seule alerte sonore : le risque sous 48 h');
-  const nw = notWeekly(s.silent);
-  assert.ok(nw.length >= 1 && nw.length <= 3, `silencieux hors résumés : ${nw.length}`);
-  assert.equal(s.silent.length - nw.length, 3, 'un résumé par lundi');
+  assert.equal(s.sent.length, 2);
+  assert.equal(s.sent[0].silent, true);
+  assert.equal(s.sent[1].silent, false);
 });
 
 test('format : tout message d’incident tient en 3 lignes au plus', async () => {
@@ -546,8 +578,10 @@ test('configuration : seuils documentés', () => {
   assert.equal(CONFIG.freshnessMaxHours, 120);
   assert.equal(CONFIG.healthAttempts, 3);
   assert.equal(CONFIG.retryDelayMs, 20_000);
-  assert.equal(CONFIG.soundCapPerDay, 3);
-  assert.deepEqual(CONFIG.renotifyMs, { urgent: null, important: null });
+  for (const k of ['soundCapPerDay', 'renotifyMs', 'weeklyHourZurich', 'recurrenceWindowMs', 'downgradeAfterRuns', 'diskUrgentPct']) {
+    assert.ok(!(k in CONFIG), `${k} supprimé (règle Telegram du 23.11)`);
+  }
+  assert.equal(CONFIG.diskReadOnlyPct, 95);
 });
 
 // ───────────────────────────── mode secours (21.11.2026) ─────────────────────────────
@@ -574,12 +608,12 @@ test('SECOURS — chaque passage se signale au cockpit (?secours=1)', async () =
   assert.equal(urlSecours('pas une url'), 'pas une url');
 });
 
-test('SECOURS — cockpit muet depuis 40 min : alerte URGENTE sonore + le secours fait les contrôles', async () => {
+test('SECOURS — cockpit muet depuis 40 min : alerte IMPORTANTE sans son (la surveillance est en panne, pas le site) + le secours fait les contrôles', async () => {
   const r = await run({ principal: vivant(T0 - 40 * MIN) }, { env: SECOURS_ENV });
   assert.ok(r.calls.health >= 1, 'le secours contrôle le site lui-même');
   assert.equal(r.calls.telegram.length, 1);
-  assert.equal(r.calls.telegram[0].silent, false);
-  assert.match(r.calls.telegram[0].text, /^🔴 URGENT — La surveillance principale \(cockpit\) ne tourne plus : dernier passage il y a 40 min/);
+  assert.equal(r.calls.telegram[0].silent, true);
+  assert.match(r.calls.telegram[0].text, /^🟠 IMPORTANT — La surveillance principale \(cockpit\) ne tourne plus : dernier passage il y a 40 min/);
   assert.match(r.calls.telegram[0].text, /\nAction : Railway → service admin-backend/);
 });
 
@@ -592,15 +626,14 @@ test('SECOURS — cockpit injoignable, ou joignable sans signe de vie : alerte',
   assert.match(c.calls.telegram[0].text, /surveillance désactivée dans le cockpit/);
 });
 
-test('SECOURS — cockpit arrêté ET base en panne : deux causes, deux messages sonores', async () => {
+test('SECOURS — cockpit arrêté ET base en panne : deux causes, deux messages (la panne seule sonne)', async () => {
   const r = await run({ ...DOWN, principal: vivant(T0 - 2 * H) }, { env: SECOURS_ENV });
   assert.equal(r.calls.telegram.length, 2);
-  assert.ok(r.calls.telegram.every((m) => !m.silent));
-  assert.ok(r.calls.telegram.some((m) => /surveillance principale/.test(m.text)));
-  assert.ok(r.calls.telegram.some((m) => /Base de données ou \/api\/health injoignable/.test(m.text)));
+  assert.ok(r.calls.telegram.some((m) => /^🟠 IMPORTANT — La surveillance principale/.test(m.text) && m.silent));
+  assert.ok(r.calls.telegram.some((m) => /^🔴 URGENT — Base de données ou \/api\/health injoignable/.test(m.text) && !m.silent));
 });
 
-test('SECOURS — le cockpit revient : passation silencieuse, clôture silencieuse 1 h plus tard', async () => {
+test('SECOURS — le cockpit revient : passation silencieuse, RÉSOLU silencieux 1 h plus tard', async () => {
   const mort = await run({ ...DOWN, principal: vivant(T0 - 2 * H) }, { env: SECOURS_ENV });
   assert.equal(mort.calls.telegram.length, 2);
   const retour = await run({ ...DOWN, principal: vivant(T0 + 3 * H - MIN) }, { env: SECOURS_ENV, prevState: mort.state, nowMs: T0 + 3 * H });
@@ -609,10 +642,10 @@ test('SECOURS — le cockpit revient : passation silencieuse, clôture silencieu
   const plusTard = await run({ principal: vivant(T0 + 5 * H - MIN) }, { env: SECOURS_ENV, prevState: retour.state, nowMs: T0 + 5 * H });
   assert.equal(plusTard.calls.telegram.length, 1);
   assert.equal(plusTard.calls.telegram[0].silent, true);
-  assert.match(plusTard.calls.telegram[0].text, /^🟢 RÉSOLU — Surveillance principale \(cockpit\)/);
+  assert.match(plusTard.calls.telegram[0].text, /^🟢 RÉSOLU — Surveillance principale \(cockpit\) : .*\nCause : dernier passage il y a 2 h/);
 });
 
-test('SECOURS — ni résumé du lundi ni message « n’a pas tourné » (le secours passe rarement, c’est normal)', async () => {
+test('SECOURS — ni bilan du lundi ni message « n’a pas tourné » (le secours passe rarement, c’est normal)', async () => {
   const r1 = await run({ principal: vivant(T0 - MIN) }, { env: SECOURS_ENV, nowMs: T0 });
   const lundi = Date.UTC(2026, 10, 23, 7, 0); // lundi 08:00 heure suisse, 3 jours plus tard
   const r2 = await run({ principal: vivant(lundi - MIN) }, { env: SECOURS_ENV, prevState: r1.state, nowMs: lundi });
@@ -749,7 +782,7 @@ for (const [nom, boite] of [
     assert.equal(ok.calls.telegram.length, 0);
     const clos = await runBoite({ boite: boiteOk([]) }, { prevState: ok.state, nowMs: T0 + 100 * MIN });
     assert.equal(clos.calls.telegram.length, 1);
-    assert.match(clos.calls.telegram[0].text, /^🟢 RÉSOLU — Boîte d’alertes du cockpit/);
+    assert.match(clos.calls.telegram[0].text, /^🟢 RÉSOLU — Boîte d’alertes du cockpit : .*\nCause : /);
   });
 }
 
@@ -799,42 +832,24 @@ test('BOÎTE — dans GitHub Actions sans jeton OIDC : pas d’incident, mais le
 
 const direct = (d, plusAncien = null, now = T0) => ({ ...vivant(now - MIN), telegram: { direct: d, boite: { active: true, en_attente: 0, plus_ancien: plusAncien } } });
 
-test('TELEGRAM COCKPIT — échec plus récent que le dernier succès : un message silencieux avec le détail, une fois, clos après un succès postérieur', async () => {
+test('TELEGRAM COCKPIT — l’échec du bot direct du cockpit ne produit plus aucun message (ni ouverture, ni résolu) : une ligne de journal sans texte sensible', async () => {
   const echec = new Date(T0 - 40 * MIN).toISOString();
-  const d = { configure: true, dernier_ok: new Date(T0 - 3 * H).toISOString(), dernier_echec: echec, dernier_echec_detail: 'HTTP 403 — Forbidden: bot was blocked by the user' };
+  const d = { configure: true, dernier_ok: new Date(T0 - 3 * H).toISOString(), dernier_echec: echec, dernier_echec_detail: 'HTTP 403 — Forbidden: bot was blocked by the user bot123456:AAA-bbb_CCC' };
   const r1 = await runBoite({ site: { principal: direct(d) } });
-  assert.equal(r1.calls.telegram.length, 1);
-  const m = r1.calls.telegram[0];
-  assert.equal(m.silent, true);
-  assert.match(m.text, /Le bot du cockpit n’arrive plus à envoyer depuis 13:20 UTC \(HTTP 403 — Forbidden: bot was blocked by the user\)/);
-  assert.match(m.text, /ses alertes te parviennent quand même ici/);
-  assert.ok(lines(m.text) <= 3);
-  assert.ok(!r1.logs.join('\n').includes('Forbidden'), 'le détail ne va pas dans le journal public');
+  assert.equal(r1.calls.telegram.length, 0);
+  assert.equal(r1.state.incidents.telegram_cockpit, undefined);
+  assert.equal(r1.state.pending.telegram_cockpit, undefined);
+  const ligne = r1.logs.find((l) => l.startsWith('[T]'));
+  assert.match(ligne, /^\[T\] WARN — envoi direct du cockpit : échec en cours/);
+  const all = r1.logs.join('\n') + JSON.stringify(r1.results.map(({ health, ...x }) => x));
+  assert.ok(!all.includes('Forbidden') && !all.includes('bot123456'), 'ni description d’erreur ni jeton dans le journal');
   const r2 = await runBoite({ site: { principal: direct(d, null, T0 + 10 * MIN) } }, { prevState: r1.state, nowMs: T0 + 10 * MIN });
-  assert.equal(r2.calls.telegram.length, 0, 'une seule fois');
+  assert.equal(r2.calls.telegram.length, 0);
   const bon = { ...d, dernier_ok: new Date(T0 + 15 * MIN).toISOString() };
-  const r3 = await runBoite({ site: { principal: direct(bon, null, T0 + 20 * MIN) } }, { prevState: r2.state, nowMs: T0 + 20 * MIN });
-  assert.equal(r3.calls.telegram.length, 0);
-  const r4 = await runBoite({ site: { principal: direct(bon, null, T0 + 90 * MIN) } }, { prevState: r3.state, nowMs: T0 + 90 * MIN });
-  assert.equal(r4.calls.telegram.length, 1);
-  assert.match(r4.calls.telegram[0].text, /^🟢 RÉSOLU — Envoi Telegram direct du cockpit/);
-});
-
-test('TELEGRAM COCKPIT — jamais envoyé avec succès : incident ; aucun échec : rien ; cockpit mort : rien', async () => {
-  const d = { configure: true, dernier_ok: null, dernier_echec: new Date(T0 - 5 * MIN).toISOString(), dernier_echec_detail: 'non configuré' };
-  const r = await runBoite({ site: { principal: direct(d) } });
-  assert.equal(r.calls.telegram.length, 1);
+  const r3 = await runBoite({ site: { principal: direct(bon, null, T0 + 90 * MIN) } }, { prevState: r2.state, nowMs: T0 + 90 * MIN });
+  assert.equal(r3.calls.telegram.length, 0, 'pas de « résolu » non plus');
   const calme = await runBoite({ site: { principal: direct({ configure: true, dernier_ok: null, dernier_echec: null }) } });
   assert.equal(calme.calls.telegram.length, 0);
-  const mort = await runBoite({ site: { principal: { ...direct(d), surveillance_site: { actif: true, dernier_passage: new Date(T0 - 2 * H).toISOString() } } } });
-  assert.ok(!mort.calls.telegram.some((m) => /bot du cockpit/.test(m.text)));
-});
-
-test('TELEGRAM COCKPIT — le détail est nettoyé d’un éventuel jeton et borné', async () => {
-  const d = { configure: true, dernier_ok: null, dernier_echec: new Date(T0 - MIN).toISOString(), dernier_echec_detail: `HTTP 401 — bot123456:AAA-bbb_CCC Unauthorized ${'x'.repeat(300)}` };
-  const r = await runBoite({ site: { principal: direct(d) } });
-  assert.ok(!/bot123456/.test(r.calls.telegram[0].text));
-  assert.ok(r.calls.telegram[0].text.length < 500);
 });
 
 test('BOÎTE — plus ancien message du cockpit de plus de 30 min alors que le relais n’a rien relevé : incident « boîte »', async () => {
