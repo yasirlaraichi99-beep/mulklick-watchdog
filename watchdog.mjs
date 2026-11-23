@@ -12,26 +12,28 @@
 //   C — fraîcheur  : age_hours (rendu par /api/health) ≤ seuil.
 //   D — disque     : disk_level / disk_pct (rendus par /api/health), avec projection du remplissage.
 //
-// RÈGLES DE COMMUNICATION (Yasir, 20.11.2026 — prioritaires sur toute autre consigne de message) :
-//   - Aucun message quand tout va bien. Pas de message quotidien.
-//   - URGENT (panne, données absentes, risque sous 48 h) : message AVEC son, immédiat.
-//     IMPORTANT (risque prévu sous 30 jours, anomalie confirmée) : message SILENCIEUX, une seule fois.
-//     INFORMATION : uniquement dans le résumé hebdomadaire silencieux du lundi (08:00 heure suisse).
-//   - Regroupement : les symptômes d'une même cause donnent UN message (ex. base injoignable + page vide).
-//   - Pas de répétition : un problème signalé ne redonne un message que s'il s'aggrave ou change de
-//     niveau (ou après une durée configurable, désactivée par défaut). Un problème qui revient peu
-//     après sa résolution est une RÉCIDIVE : un seul message silencieux. La résolution donne un
-//     message silencieux de clôture, une fois le retour à la normale confirmé (1 h, 6 h après récidive).
-//   - Plafond : au plus 3 messages sonores par jour hors panne en cours ; au-delà, regroupés en un
-//     message silencieux qui le dit (et redonnés avec son le lendemain s'ils durent).
-//   - Format : trois lignes au plus — ce qui se passe, gravité, action recommandée. Le détail est
-//     dans le journal du run (onglet Actions).
-//   - Preuve de vie sans message : un arrêt du watchdog de plus de 2 h est signalé à la reprise ;
-//     un contrôleur de vie externe facultatif (secret HEARTBEAT_URL, ex. healthchecks.io) reçoit un
-//     signal à chaque passage et alerte, lui, si le watchdog se tait ; le watchdog alerte si ce
-//     contrôleur ne répond plus.
+// RÈGLE TELEGRAM (Yasir, 23.11.2026 — prioritaire sur toute autre consigne de message) :
+//   « Je ne dois pas être dérangé. Je reçois uniquement : 1. URGENT, avec son : une panne en cours
+//   (site, API, base, paiement). 2. IMPORTANT, sans son : un risque détecté AVANT la panne. 3. Le bilan
+//   de la semaine, le lundi à 7h, sans son (celui du cockpit : ce dépôt n'envoie plus de résumé).
+//   Rien d'autre. Un seul message par incident, puis un seul message « résolu » avec la durée et la
+//   cause. Jamais de répétition. »
+//   - Aucun message quand tout va bien.
+//   - Ouverture : UN message (🔴 URGENT avec son, ou 🟠 IMPORTANT sans son), 3 lignes au plus :
+//     ce qui se passe, gravité + « Depuis … UTC », action exacte.
+//     Exception unique : un risque IMPORTANT qui devient une vraie panne donne UN message URGENT.
+//   - Fin : UN message 🟢 RÉSOLU sans son (titre, durée, début → fin, cause = dernier symptôme mesuré),
+//     après un retour à la normale continu d'1 h (anti yo-yo).
+//   - Un problème qui revient APRÈS son « résolu » est un nouvel incident : ouverture normale.
+//   - Interdits : rappel, « toujours en cours », aggravation, amélioration, « REGROUPÉ », plafond de
+//     sons, résumé, digest, message de test.
+//   - Regroupement : les symptômes d'une même cause donnent UN message (base injoignable + page vide).
+//   - Son : seulement une panne en cours (page, API, base). Tout le reste est un risque : sans son.
+//   - Preuve de vie sans message : un arrêt du watchdog de plus de 2 h est signalé à la reprise (IMPORTANT,
+//     hors mode secours) ; un contrôleur de vie externe facultatif (secret HEARTBEAT_URL) reçoit un
+//     signal à chaque passage ; le watchdog signale (IMPORTANT) si ce contrôleur ne répond plus.
 //
-// État (anti-spam, incidents, résumé) : relu depuis WATCHDOG_STATE_FILE (cache Actions). Un message
+// État (anti-spam, incidents) : relu depuis WATCHDOG_STATE_FILE (cache Actions). Un message
 // non parti n'avance pas l'état : il repartira au passage suivant, et le job échoue.
 //
 // Aucune dépendance : Node ≥ 20 (fetch global). Le module exporte sa logique pour les tests
@@ -76,21 +78,13 @@ export const CONFIG = {
   // ── Communication ──
   confirmRuns: 2, // anomalie « confirmée » : vue 2 passages de suite avant un message IMPORTANT
   resolveAfterOkMs: HOUR, // clôture après 1 h de retour à la normale continu (pas de yo-yo)
-  recurrenceWindowMs: 6 * HOUR, // un problème revenu moins de 6 h après sa clôture = récidive
-  recurrenceResolveAfterOkMs: 6 * HOUR, // après une récidive, clôture seulement après 6 h normales
-  downgradeAfterRuns: 3, // un niveau ne baisse qu'après 3 passages plus bas de suite
-  renotifyMs: { urgent: null, important: null }, // null = jamais : répétition seulement si ça s'aggrave
-  soundCapPerDay: 3, // messages sonores par jour (heure suisse), hors panne en cours
-  weeklyHourZurich: 8, // résumé du lundi, à partir de 08:00 heure suisse
   runEveryMs: 10 * MIN,
-  gapInfoMs: 25 * MIN, // trou entre deux passages noté pour le résumé du lundi
   gapImportantMs: 2 * HOUR, // watchdog arrêté plus de 2 h : message IMPORTANT à la reprise
 
   // ── Disque ──
   diskWarnPct: 65, // seuil « avertissement » calculé côté site (/api/health)
-  diskUrgentPct: 90, // à 95 %, Supabase passe la base en lecture seule
-  diskReadOnlyPct: 95,
-  diskUrgentDays: 2, // « risque sous 48 h »
+  diskReadOnlyPct: 95, // à 95 %, Supabase passe la base en lecture seule : seule vraie panne (URGENT)
+  diskUrgentDays: 2, // « risque sous 48 h » : IMPORTANT tant que la base n'est pas en lecture seule
   diskImportantDays: 30, // « risque prévu sous 30 jours »
   diskMinStepMs: 12 * HOUR, // pas de projection sur un palier franchi en moins de 12 h (à-coups du scraper)
   diskHysteresisPct: 5, // un incident disque ne se clôt que 5 points sous 65 % (pas de yo-yo)
@@ -124,7 +118,6 @@ const TITLES = {
   disque_lecture: 'Lecture du niveau du disque',
   relais: 'Contrôleur de vie du watchdog',
   principal: 'Surveillance principale (cockpit)',
-  telegram_cockpit: 'Envoi Telegram direct du cockpit',
   boite: 'Boîte d’alertes du cockpit',
 };
 
@@ -136,7 +129,6 @@ const ACTIONS = {
   disque_lecture: 'vérifier /api/health (champs disk_level, disk_pct) et le dernier déploiement du site.',
   relais: 'vérifier le compte du contrôleur de vie ; le watchdog, lui, continue de surveiller.',
   principal: 'Railway → service admin-backend : vérifier le dernier déploiement et ses journaux ; en attendant, ce secours fait les contrôles quand il passe.',
-  telegram_cockpit: 'revoir le bot Telegram du cockpit (variables Railway) quand tu as un moment ; rien d’urgent.',
   boite: 'onglet Actions de mulklick-watchdog (étape « Secours ») et déploiement du cockpit sur Railway.',
 };
 
@@ -155,39 +147,6 @@ async function fetchWithTimeout(fetchImpl, url, init = {}, timeoutMs = CONFIG.re
 function fmtUtc(nowMs) {
   const d = new Date(nowMs).toISOString();
   return `${d.slice(8, 10)}.${d.slice(5, 7)} ${d.slice(11, 16)} UTC`;
-}
-
-/** Date (AAAA-MM-JJ), heure, jour de semaine (1 = lundi … 7 = dimanche) et libellé à l'heure suisse. */
-export function zurichNow(nowMs) {
-  const f = new Intl.DateTimeFormat('fr-CH', {
-    timeZone: 'Europe/Zurich',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  });
-  const p = Object.fromEntries(f.formatToParts(new Date(nowMs)).map((x) => [x.type, x.value]));
-  const date = `${p.year}-${p.month}-${p.day}`;
-  const wd = new Date(`${date}T00:00:00Z`).getUTCDay();
-  return {
-    date,
-    hour: Number(p.hour),
-    weekday: wd === 0 ? 7 : wd,
-    label: `${p.day}.${p.month}.${p.year} ${p.hour}:${p.minute}`,
-    short: `${p.day}.${p.month}`,
-  };
-}
-
-/** Clé de semaine : date suisse du lundi dont 08:00 est le dernier passé (début de la période en cours). */
-export function weekKey(nowMs, cfg = CONFIG) {
-  const z = zurichNow(nowMs);
-  let back = z.weekday - 1;
-  if (z.weekday === 1 && z.hour < cfg.weeklyHourZurich) back = 7;
-  const d = new Date(`${z.date}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - back);
-  return d.toISOString().slice(0, 10);
 }
 
 function fmtDuration(ms) {
@@ -318,24 +277,14 @@ export function checkDisk(healthResult) {
 
 // ───────────────────────────── état ─────────────────────────────
 
-function newPeriod(nowMs) {
-  return { since: nowMs, runs: 0, incidents: [], gaps: [], startPct: null, lastPct: null, capture: null, reset: false };
-}
-
-function freshState(nowMs, cfg) {
+function freshState() {
   return {
     version: 2,
     incidents: {},
     pending: {},
-    closed: {},
     pendingGap: null,
-    // La période commence un intervalle avant ce premier passage, qui y est compté : le résumé
-    // compare ainsi des passages faits à des passages attendus sur la même base.
-    period: newPeriod(nowMs - cfg.runEveryMs),
-    lastWeeklyKey: weekKey(nowMs, cfg), // la semaine en cours commence maintenant : pas de résumé immédiat
     lastRunAt: null,
     diskSteps: {},
-    sound: { day: null, count: 0 },
     heartbeatFails: 0,
   };
 }
@@ -344,23 +293,16 @@ const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 
 /**
  * Normalise l'état relu. Un état valide est complété champ par champ ; un état illisible (ancienne
- * version, fichier tronqué) repart de zéro sans rien envoyer, et le résumé du lundi le signale.
+ * version, fichier tronqué) repart de zéro sans rien envoyer. Les anciens champs (résumé, plafond de
+ * sons, clôtures récentes) et les incidents de causes supprimées sont écartés sans message.
  */
-export function normalizeState(prev, nowMs, cfg = CONFIG) {
-  if (prev === null || prev === undefined) return freshState(nowMs, cfg);
-  if (!isObj(prev) || prev.version !== 2) {
-    const s = freshState(nowMs, cfg);
-    s.period.reset = !(isObj(prev) && prev.version === 1); // la v1 est une migration connue, pas une perte
-    return s;
-  }
-  const base = freshState(nowMs, cfg);
+export function normalizeState(prev) {
+  if (prev === null || prev === undefined) return freshState();
+  if (!isObj(prev) || prev.version !== 2) return freshState();
   const s = structuredClone(prev);
-  for (const k of ['incidents', 'pending', 'closed', 'diskSteps']) if (!isObj(s[k])) s[k] = {};
-  if (!isObj(s.period) || typeof s.period.since !== 'number') s.period = { ...base.period, reset: true };
-  s.period = { ...newPeriod(s.period.since), ...s.period };
-  for (const k of ['incidents', 'gaps']) if (!Array.isArray(s.period[k])) s.period[k] = [];
-  if (!isObj(s.sound)) s.sound = { day: null, count: 0 };
-  if (typeof s.lastWeeklyKey !== 'string') s.lastWeeklyKey = base.lastWeeklyKey;
+  for (const k of ['incidents', 'pending', 'diskSteps']) if (!isObj(s[k])) s[k] = {};
+  for (const k of ['period', 'sound', 'closed', 'lastWeeklyKey']) delete s[k];
+  for (const k of ['incidents', 'pending']) for (const key of Object.keys(s[k])) if (!TITLES[key]) delete s[k][key];
   if (typeof s.lastRunAt !== 'number') s.lastRunAt = null;
   if (typeof s.heartbeatFails !== 'number') s.heartbeatFails = 0;
   if (!isObj(s.pendingGap)) s.pendingGap = null;
@@ -415,27 +357,21 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
   const p = by.P;
   if (p && p.status !== 'ok') {
     out.push({
-      key: 'principal', level: 'urgent', panne: false, rank: 3,
+      // La surveillance est en panne, pas le site : IMPORTANT sans son. Si mulklick.ch est réellement
+      // en panne, les contrôles A/B de ce secours donnent eux-mêmes l'URGENT.
+      key: 'principal', level: 'important', panne: false, symptom: p.value,
       what: `La surveillance principale (cockpit) ne tourne plus : ${p.value}.`,
       gravity: 'plus aucun contrôle toutes les 5 min ; ce secours GitHub ne passe que de temps en temps.',
     });
   }
-  // Cockpit vivant seulement : son envoi direct et sa boîte d'alertes. Cockpit mort : on ne sait rien
-  // d'eux, leurs incidents restent tels quels (le message « cockpit arrêté » suffit, pas de doublon).
-  const t = by.T;
-  if (!p || p.status !== 'ok' || !t || t.status === 'skip') unmeasured.add('telegram_cockpit');
-  else if (t.status === 'warn') {
-    out.push({
-      key: 'telegram_cockpit', level: 'important', panne: false, rank: 1,
-      what: `Le bot du cockpit n’arrive plus à envoyer depuis ${t.since}${t.detail ? ` (${t.detail})` : ''}.`,
-      gravity: 'ses alertes te parviennent quand même ici, par le relais.',
-    });
-  }
+  // Cockpit vivant seulement : sa boîte d'alertes. Cockpit mort : on ne sait rien d'elle, son incident
+  // reste tel quel (le message « cockpit arrêté » suffit, pas de doublon). L'échec du bot direct du
+  // cockpit (T) n'est plus un message : seulement une ligne de journal sans texte sensible.
   const k = by.K;
   if (!p || p.status !== 'ok' || !k || k.status === 'skip') unmeasured.add('boite');
   else if (k.status === 'crit') {
     out.push({
-      key: 'boite', level: 'important', panne: false, rank: 1, confirm: true,
+      key: 'boite', level: 'important', panne: false, confirm: true, symptom: k.value,
       what: `Les alertes du cockpit ne te parviennent plus (${k.value}).`,
       gravity: k.fallback
         ? 'en attendant, le relais refait lui-même les contrôles du site.'
@@ -452,7 +388,7 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
     // Une seule cause : la page vide est un symptôme de la base injoignable.
     const page = b.status !== 'ok' ? ` ; page publique : ${b.value}` : '';
     out.push({
-      key: 'base', level: 'urgent', panne: true, rank: 3,
+      key: 'base', level: 'urgent', panne: true, symptom: a.value,
       what: `Base de données ou /api/health injoignable (${a.value})${page}.`,
       gravity: 'panne en cours, les visiteurs peuvent voir des pages sans données.',
     });
@@ -460,20 +396,20 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
   } else if (b.status !== 'ok' && baseOpen) {
     // Même incident : la base répond de nouveau, la page n'est pas encore rafraîchie (cache ≤ 1 h).
     out.push({
-      key: 'base', level: 'urgent', panne: true, rank: 3,
+      key: 'base', level: 'urgent', panne: true, symptom: b.value,
       what: `La base répond de nouveau, mais la page publique reste sans données (${b.value}).`,
       gravity: 'même incident, cache du site pas encore rafraîchi (jusqu’à 1 h).',
     });
     unmeasured.add('site');
   } else if (b.status === 'crit') {
     out.push({
-      key: 'site', level: 'urgent', panne: true, rank: 3,
+      key: 'site', level: 'urgent', panne: true, symptom: b.value,
       what: `Page publique sans données alors que la base répond (${b.value}).`,
       gravity: 'données absentes de mulklick.ch.',
     });
   } else if (b.status === 'warn') {
     out.push({
-      key: 'site', level: 'important', panne: false, rank: 1, confirm: true,
+      key: 'site', level: 'important', panne: false, confirm: true, symptom: b.value,
       what: `Page publique incomplète (${b.value}).`,
       gravity: 'anomalie confirmée, une partie des chiffres manque.',
     });
@@ -482,7 +418,7 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
   if (c.status === 'skip') unmeasured.add('fraicheur');
   else if (c.status === 'warn') {
     out.push({
-      key: 'fraicheur', level: 'important', panne: false, rank: 1, confirm: true,
+      key: 'fraicheur', level: 'important', panne: false, confirm: true, symptom: c.value,
       what: `Données de marché trop anciennes (${c.value}).`,
       gravity: 'anomalie confirmée, le site affiche des chiffres datés.',
     });
@@ -495,7 +431,7 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
     // Lecture impossible : cause distincte ; l'incident « disque » éventuel reste tel quel.
     unmeasured.add('disque');
     out.push({
-      key: 'disque_lecture', level: 'important', panne: false, rank: 1, confirm: true,
+      key: 'disque_lecture', level: 'important', panne: false, confirm: true, symptom: d.value,
       what: `Niveau du disque illisible (${d.value}).`,
       gravity: 'anomalie confirmée, le disque n’est plus surveillé.',
     });
@@ -503,39 +439,31 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
     const pct = d.pct;
     const days = projectDiskDays(state.diskSteps, pct, cfg);
     let level = null;
-    let rank = 0;
-    if (pct >= cfg.diskUrgentPct || (days !== null && days < cfg.diskUrgentDays)) {
-      level = 'urgent';
-      rank = 3;
-    } else if (d.level === 'critique' || (days !== null && days < cfg.diskImportantDays)) {
-      level = 'important';
-      rank = 2;
-    } else if (d.level === 'avertissement') {
-      level = 'important';
-      rank = 1;
-    }
+    // URGENT seulement quand la base est réellement en lecture seule (95 %). Avant : un risque, même
+    // « sous 48 h » → IMPORTANT sans son.
+    if (pct >= cfg.diskReadOnlyPct) level = 'urgent';
+    else if (d.level === 'critique' || d.level === 'avertissement' || (days !== null && days < cfg.diskImportantDays)) level = 'important';
     const open = state.incidents.disque;
     // Hystérésis : un incident ouvert reste ouvert tant qu'on n'est pas 5 points sous le seuil de 65 %.
-    if (!level && open && pct >= cfg.diskWarnPct - cfg.diskHysteresisPct) {
-      level = 'important';
-      rank = 1;
-    }
+    if (!level && open && pct >= cfg.diskWarnPct - cfg.diskHysteresisPct) level = 'important';
     if (level) {
       const proj = days !== null ? `, plein (95 %) dans ≈ ${Math.max(0, Math.round(days))} j au rythme actuel` : '';
       out.push({
-        key: 'disque', level, panne: false, rank, pct,
+        key: 'disque', level, panne: level === 'urgent', pct, symptom: `disque ≈ ${pct} % de 18 GB${proj}`,
         what: `Disque de la base ≈ ${pct} % de 18 GB${proj}.`,
         gravity:
           level === 'urgent'
-            ? 'risque sous 48 h : à 95 %, Supabase bloque la base et le site perd ses données.'
-            : 'risque à venir : à 95 %, Supabase bloque la base et le site perd ses données.',
+            ? 'la base est en lecture seule (95 %) : le site perd ses données.'
+            : days !== null && days < cfg.diskUrgentDays
+              ? 'risque sous 48 h : à 95 %, Supabase bloque la base et le site perd ses données.'
+              : 'risque à venir : à 95 %, Supabase bloque la base et le site perd ses données.',
       });
     }
   }
 
   if (state.heartbeatFails >= cfg.heartbeatFailRuns) {
     out.push({
-      key: 'relais', level: 'urgent', panne: false, rank: 3,
+      key: 'relais', level: 'important', panne: false, symptom: `${state.heartbeatFails} signaux de vie refusés`,
       what: `Le contrôleur de vie du watchdog ne répond plus (${state.heartbeatFails} signaux de vie refusés).`,
       gravity: 'si le watchdog s’arrêtait maintenant, personne ne le saurait.',
     });
@@ -545,25 +473,17 @@ export function deriveIncidents(results, state, nowMs, cfg = CONFIG) {
 
 // ───────────────────────────── messages (3 lignes au plus) ─────────────────────────────
 
-function incidentText(kind, inc, nowMs, since) {
-  const head = {
-    open: `${ICON[inc.level]} ${LEVEL[inc.level]} — ${inc.what}`,
-    worse: `${ICON[inc.level]} ${LEVEL[inc.level]} — S’AGGRAVE : ${inc.what}`,
-    better: `🟠 ${LEVEL[inc.level]} — S’AMÉLIORE : ${inc.what}`,
-    recur: `🔁 ${LEVEL[inc.level]} — RÉCIDIVE : ${inc.what}`,
-    remind: `${ICON[inc.level]} ${LEVEL[inc.level]} — TOUJOURS EN COURS depuis ${fmtDuration(nowMs - since)} : ${inc.what}`,
-  }[kind];
-  const gravity =
-    kind === 'recur'
-      ? `même problème, revenu moins de 6 h après sa résolution ; plus de message avant 6 h de retour à la normale. Premier constat ${fmtUtc(since)}.`
-      : `${inc.gravity} Depuis ${fmtUtc(since)}.`;
-  return [head, `Gravité : ${gravity}`, `Action : ${ACTIONS[inc.key]}`].join('\n');
+function incidentText(inc, since) {
+  const head = `${ICON[inc.level]} ${LEVEL[inc.level]} — ${inc.what}`;
+  return [head, `Gravité : ${inc.gravity} Depuis ${fmtUtc(since)}.`, `Action : ${ACTIONS[inc.key]}`].join('\n');
 }
 
-function closeText(key, okSince, openedAt) {
+/** Message de fin : durée, début → fin, cause = dernier symptôme mesuré (jamais une supposition). */
+function closeText(key, okSince, openedAt, symptom) {
+  const cause = typeof symptom === 'string' && symptom ? symptom.replace(/[.\s]+$/, '') : 'non identifiée par la surveillance';
   return [
-    `🟢 RÉSOLU — ${TITLES[key]} : revenu à la normale le ${fmtUtc(okSince)}, après ${fmtDuration(okSince - openedAt)}.`,
-    'Action : aucune.',
+    `🟢 RÉSOLU — ${TITLES[key]} : ${fmtDuration(okSince - openedAt)} (${fmtUtc(openedAt).replace(' UTC', '')} → ${fmtUtc(okSince)}).`,
+    `Cause : ${cause}.`,
   ].join('\n');
 }
 
@@ -571,40 +491,7 @@ function gapText(fromMs, toMs) {
   return [
     `🟠 IMPORTANT — Le watchdog n’a pas tourné pendant ${fmtDuration(toMs - fromMs)} (du ${fmtUtc(fromMs)} au ${fmtUtc(toMs)}).`,
     'Gravité : rien n’a été surveillé pendant ce temps ; il tourne de nouveau.',
-    'Action : vérifier l’historique de cron-job.org et l’onglet Actions de mulklick-watchdog.',
-  ].join('\n');
-}
-
-function weeklyText(state, nowMs, env, cfg) {
-  const p = state.period;
-  const from = zurichNow(p.since + cfg.runEveryMs).short; // premier passage de la période
-  const to = zurichNow(nowMs).short;
-  const inc = p.incidents.length
-    ? `${p.incidents.length} incident${p.incidents.length > 1 ? 's' : ''} (${[...new Set(p.incidents)].join(', ')})`
-    : 'aucun incident';
-  const expected = Math.max(1, Math.round((nowMs - p.since) / cfg.runEveryMs));
-  const gaps = p.gaps.length ? `, ${p.gaps.length} interruption${p.gaps.length > 1 ? 's' : ''}` : '';
-  const reset = p.reset ? ', état réinitialisé (cache perdu)' : '';
-  const pct = p.lastPct;
-  const trend = pct === null ? '' : p.startPct === null || pct === p.startPct ? ' (stable)' : ` (${pct > p.startPct ? '+' : ''}${pct - p.startPct} pts)`;
-  const disk = pct === null ? 'disque non mesuré' : `disque ≈ ${pct} % de 18 GB${trend}`;
-  const capture = p.capture ? `dernière capture ${p.capture}` : 'capture non mesurée';
-  const open = Object.keys(state.incidents);
-  const actions = [];
-  if (open.length) actions.push(`incident(s) encore ouvert(s) : ${open.map((k) => TITLES[k]).join(', ')}`);
-  if (!env.HEARTBEAT_URL) actions.push('contrôleur de vie externe non configuré');
-  return [
-    `📋 Semaine du ${from} au ${to} : ${inc}.`,
-    `Surveillance : ${p.runs} passages sur ≈ ${expected}${gaps}${reset} · ${disk} · ${capture}.`,
-    `Action : ${actions.length ? actions.join(' ; ') : 'aucune'}.`,
-  ].join('\n');
-}
-
-export function testSummary(results, nowMs) {
-  const mark = { ok: '✅', warn: '🟠', crit: '🔴', skip: '⏭️' };
-  return [
-    `🧪 TEST — Watchdog Mulklick (lancement manuel, ${fmtUtc(nowMs)})`,
-    ...results.map((r) => `${mark[r.status]} ${r.id} : ${r.value}`),
+    'Action : GitHub → mulklick-watchdog → Actions → « Relais du secours » : lire le passage en échec ; si la chaîne est arrêtée, cliquer « Run workflow ».',
   ].join('\n');
 }
 
@@ -617,44 +504,32 @@ export function testSummary(results, nowMs) {
  * Message : { text, sound, panne, key, commit(state) }.
  */
 export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
-  const s = normalizeState(prevState, nowMs, cfg);
-  const z = zurichNow(nowMs);
+  const s = normalizeState(prevState);
   const msgs = [];
   const by = Object.fromEntries(results.map((r) => [r.id, r]));
 
-  // En mode secours, ni messages d'arrêt (ce workflow passe rarement, c'est attendu) ni résumé du
-  // lundi : la surveillance principale du cockpit s'en charge.
+  // En mode secours, pas de message « n'a pas tourné » (ce workflow passe rarement, c'est attendu).
   const secours = Boolean(env.PRINCIPAL_HEALTH_URL);
 
   // 1) Preuve de vie : le watchdog s'est-il arrêté ? (une alerte non partie est gardée et renvoyée)
   if (!secours && s.lastRunAt !== null) {
     const gap = nowMs - s.lastRunAt;
     if (gap > cfg.gapImportantMs && !s.pendingGap) s.pendingGap = { from: s.lastRunAt, to: nowMs };
-    else if (gap > cfg.gapInfoMs) s.period.gaps.push(gap); // information : résumé du lundi seulement
   }
   if (s.pendingGap) {
     const g = s.pendingGap;
     msgs.push({
       text: gapText(g.from, g.to), sound: false, panne: false, key: 'gap',
-      commit: (st) => {
-        st.period.gaps.push(g.to - g.from);
-        st.pendingGap = null;
-      },
+      commit: (st) => { st.pendingGap = null; },
     });
   }
   s.lastRunAt = nowMs;
-  s.period.runs += 1;
-  for (const [k, c] of Object.entries(s.closed)) if (nowMs - c.at > cfg.recurrenceWindowMs) delete s.closed[k];
 
-  // 2) Mesures pour le résumé et la projection du disque.
-  if (by.D && typeof by.D.pct === 'number') {
-    s.diskSteps = updateDiskSteps(s.diskSteps, by.D.pct, nowMs);
-    if (s.period.startPct === null) s.period.startPct = by.D.pct;
-    s.period.lastPct = by.D.pct;
-  }
-  if (by.C && by.C.capture) s.period.capture = by.C.capture;
+  // 2) Projection du disque.
+  if (by.D && typeof by.D.pct === 'number') s.diskSteps = updateDiskSteps(s.diskSteps, by.D.pct, nowMs);
 
-  // 3) Incidents.
+  // 3) Incidents : UN message d'ouverture, jamais de rappel. Seule exception : un risque IMPORTANT
+  // devenu une vraie panne donne UN message URGENT. Une baisse de niveau ne dit rien.
   const { incidents, unmeasured } = deriveIncidents(results, s, nowMs, cfg);
   const current = new Set(incidents.map((i) => i.key));
 
@@ -667,21 +542,15 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
       pend.seen += 1;
       s.pending[inc.key] = pend;
       if (pend.seen < (inc.confirm ? cfg.confirmRuns : 1)) continue;
-      const closed = s.closed[inc.key];
-      const recur = closed && inc.rank <= closed.rank;
       const record = {
-        level: inc.level, rank: inc.rank, panne: inc.panne, openedAt: recur ? closed.openedAt : pend.first,
-        notifiedAt: nowMs, okSince: null, lowerRuns: 0, recurrences: recur ? (closed.recurrences ?? 0) + 1 : 0,
-        mutedByCap: false, pct: inc.pct,
+        level: inc.level, panne: inc.panne, openedAt: pend.first, notifiedAt: nowMs, okSince: null,
+        symptom: inc.symptom ?? null, pct: inc.pct,
       };
       msgs.push({
-        text: incidentText(recur ? 'recur' : 'open', inc, nowMs, pend.first),
-        sound: !recur && inc.level === 'urgent', panne: inc.panne, key: inc.key,
+        text: incidentText(inc, pend.first), sound: inc.level === 'urgent', panne: inc.panne, key: inc.key,
         commit: (st) => {
           st.incidents[inc.key] = { ...record };
           delete st.pending[inc.key];
-          delete st.closed[inc.key];
-          st.period.incidents.push(TITLES[inc.key]);
         },
       });
       continue;
@@ -689,115 +558,32 @@ export function planRun(prevState, results, nowMs, env = {}, cfg = CONFIG) {
     prev.okSince = null;
     prev.panne = inc.panne;
     if (inc.pct !== undefined) prev.pct = inc.pct;
-    if (inc.rank > prev.rank) {
-      prev.lowerRuns = 0;
+    if (inc.symptom) prev.symptom = inc.symptom; // dernier symptôme mesuré : la cause du message « résolu »
+    if (inc.level === 'urgent' && prev.level !== 'urgent') {
       msgs.push({
-        text: incidentText('worse', inc, nowMs, prev.openedAt), sound: inc.level === 'urgent', panne: inc.panne, key: inc.key,
-        commit: (st) => Object.assign(st.incidents[inc.key], { level: inc.level, rank: inc.rank, notifiedAt: nowMs, mutedByCap: false }),
+        text: incidentText(inc, prev.openedAt), sound: true, panne: inc.panne, key: inc.key,
+        commit: (st) => Object.assign(st.incidents[inc.key], { level: 'urgent', notifiedAt: nowMs }),
       });
-    } else if (inc.rank < prev.rank) {
-      // Baisse confirmée seulement après plusieurs passages (pas de yo-yo autour d'un seuil).
-      prev.lowerRuns = (prev.lowerRuns ?? 0) + 1;
-      if (prev.lowerRuns >= cfg.downgradeAfterRuns) {
-        if (inc.level !== prev.level) {
-          msgs.push({
-            text: incidentText('better', inc, nowMs, prev.openedAt), sound: false, panne: inc.panne, key: inc.key,
-            commit: (st) => Object.assign(st.incidents[inc.key], { level: inc.level, rank: inc.rank, notifiedAt: nowMs, lowerRuns: 0, mutedByCap: false }),
-          });
-        } else {
-          prev.rank = inc.rank; // même niveau, palier plus bas : rien à dire
-          prev.lowerRuns = 0;
-        }
-      }
-    } else {
-      prev.lowerRuns = 0;
-      const every = cfg.renotifyMs[inc.level];
-      const capReplay = prev.mutedByCap && inc.level === 'urgent' && prev.mutedDay !== z.date;
-      if (capReplay || (every && nowMs - prev.notifiedAt >= every)) {
-        msgs.push({
-          text: incidentText('remind', inc, nowMs, prev.openedAt), sound: inc.level === 'urgent', panne: inc.panne, key: inc.key,
-          commit: (st) => Object.assign(st.incidents[inc.key], { notifiedAt: nowMs, mutedByCap: false }),
-        });
-      }
     }
   }
   for (const key of Object.keys(s.pending)) if (!current.has(key) && !unmeasured.has(key)) delete s.pending[key];
 
-  // 4) Clôtures (silencieuses) après un retour à la normale continu (1 h, 6 h après une récidive).
+  // 4) Fin : UN message RÉSOLU (sans son) après un retour à la normale continu d'1 h (pas de yo-yo).
   for (const [key, prev] of Object.entries(s.incidents)) {
     if (current.has(key) || unmeasured.has(key)) continue;
     if (prev.okSince === null || prev.okSince === undefined) prev.okSince = nowMs;
-    prev.lowerRuns = 0;
-    const need = prev.recurrences ? cfg.recurrenceResolveAfterOkMs : cfg.resolveAfterOkMs;
-    if (nowMs - prev.okSince >= need) {
-      const { okSince, openedAt, rank, recurrences } = prev;
+    if (nowMs - prev.okSince >= cfg.resolveAfterOkMs) {
+      const { okSince, openedAt, symptom } = prev;
       msgs.push({
-        text: closeText(key, okSince, openedAt), sound: false, panne: false, key,
-        commit: (st) => {
-          delete st.incidents[key];
-          st.closed[key] = { at: nowMs, openedAt, rank, recurrences: recurrences ?? 0 };
-        },
+        text: closeText(key, okSince, openedAt, symptom), sound: false, panne: false, key,
+        commit: (st) => { delete st.incidents[key]; },
       });
     }
   }
 
-  // 5) Résumé hebdomadaire silencieux (lundi à partir de 08:00 heure suisse).
-  const wk = weekKey(nowMs, cfg);
-  if (secours) s.lastWeeklyKey = wk;
-  else if (s.lastWeeklyKey !== wk) {
-    msgs.push({
-      text: weeklyText(s, nowMs, env, cfg), sound: false, panne: false, key: 'weekly',
-      commit: (st) => {
-        st.lastWeeklyKey = wk;
-        const fresh = newPeriod(nowMs);
-        // Un incident ouvert à ce même passage compte dans la semaine qui commence.
-        fresh.incidents = Object.entries(st.incidents).filter(([, i]) => i.openedAt === nowMs).map(([k]) => TITLES[k]);
-        st.period = fresh;
-      },
-    });
-  }
-
-  // 6) Plafond : au plus N messages sonores par jour hors panne ; au-delà, regroupés en silencieux.
-  const used = s.sound.day === z.date ? s.sound.count : 0;
-  let planned = 0;
-  const over = [];
-  const kept = [];
-  for (const m of msgs) {
-    if (m.sound && !m.panne) {
-      if (used + planned >= cfg.soundCapPerDay) {
-        over.push(m);
-        continue;
-      }
-      planned += 1;
-      const inner = m.commit;
-      m.commit = (st) => {
-        inner(st);
-        st.sound = st.sound.day === z.date ? { day: z.date, count: st.sound.count + 1 } : { day: z.date, count: 1 };
-      };
-    }
-    kept.push(m);
-  }
-  if (over.length) {
-    const n = over.length;
-    kept.push({
-      text: [
-        `🔕 REGROUPÉ — ${n} alerte${n > 1 ? 's' : ''} urgente${n > 1 ? 's' : ''} sans son (plafond de ${cfg.soundCapPerDay} alertes sonores par jour atteint) : ${over.map((m) => TITLES[m.key]).join(' ; ')}.`,
-        'Gravité : urgente ; redonnée avec son demain si elle dure.',
-        'Action : voir le détail dans le journal du run (onglet Actions de mulklick-watchdog).',
-      ].join('\n'),
-      sound: false,
-      panne: false,
-      key: 'grouped',
-      commit: (st) =>
-        over.forEach((m) => {
-          m.commit(st);
-          if (st.incidents[m.key]) Object.assign(st.incidents[m.key], { mutedByCap: true, mutedDay: z.date });
-        }),
-    });
-  }
   // Ordre d'envoi : sonores d'abord.
-  kept.sort((x, y) => Number(y.sound) - Number(x.sound));
-  return { state: s, messages: kept };
+  msgs.sort((x, y) => Number(y.sound) - Number(x.sound));
+  return { state: s, messages: msgs };
 }
 
 // ───────────────────────────── Telegram ─────────────────────────────
@@ -891,7 +677,10 @@ export async function checkPrincipal({ fetchImpl, env, nowMs, cfg = CONFIG }) {
 
 // ───────────────────────────── boîte d'alertes du cockpit ─────────────────────────────
 
-/** Envoi direct du cockpit en échec ? Le détail (description Telegram) ne va que dans le message, jamais dans `value` (journal public). */
+/**
+ * Envoi direct du cockpit en échec ? Plus aucun message pour ça (hors règle Telegram du 23.11) : seulement
+ * une ligne de journal, sans description d'erreur, sans identifiant ni texte.
+ */
 export function checkTelegramCockpit(principal) {
   const d = principal?.health?.telegram?.direct;
   if (!d || typeof d !== 'object') return { id: 'T', status: 'skip', value: 'envoi direct du cockpit : non publié' };
@@ -900,13 +689,7 @@ export function checkTelegramCockpit(principal) {
   if (!Number.isFinite(echec) || (Number.isFinite(ok) && ok >= echec)) {
     return { id: 'T', status: 'ok', value: 'envoi direct du cockpit : sans échec en cours' };
   }
-  const detail = typeof d.dernier_echec_detail === 'string'
-    ? d.dernier_echec_detail.replace(/bot\d+:[\w-]+/g, '').replace(/\s+/g, ' ').trim().slice(0, 160)
-    : '';
-  return {
-    id: 'T', status: 'warn', value: 'envoi direct du cockpit : échec en cours',
-    since: new Date(echec).toISOString().slice(11, 16) + ' UTC', detail,
-  };
+  return { id: 'T', status: 'warn', value: 'envoi direct du cockpit : échec en cours (journal seulement, aucun message)' };
 }
 
 const boiteErreur = (value) => ({ id: 'K', status: 'crit', value, kind: 'erreur', delivered: 0, failed: false });
@@ -1059,9 +842,6 @@ export async function runOnce({ fetchImpl, sleep = realSleep, env, prevState, no
   for (const r of results) log(`[${r.id}] ${r.status.toUpperCase()} — ${r.value}`);
 
   const { state, messages } = planRun(prevState, results, nowMs, env, cfg);
-  if (String(env.WATCHDOG_TEST).toLowerCase() === 'true') {
-    messages.push({ text: testSummary(results, nowMs), sound: false, panne: false, key: 'test', commit: () => {} });
-  }
 
   const sent = [];
   for (const m of messages) {
